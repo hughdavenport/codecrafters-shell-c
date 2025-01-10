@@ -5,15 +5,17 @@ int main() {
   // Flush after every printf
   setbuf(stdout, NULL);
 
-  printf("$ ");
+  while (feof(stdin) == 0) {
+    printf("$ ");
 
-  // Wait for user input
-  char input[100];
-  fgets(input, 100, stdin);
+    // Wait for user input
+    char input[100];
+    if (fgets(input, 100, stdin) == NULL) break;
 
-  char *command = strtok(input, " \n");
+    char *command = strtok(input, " \n");
 
-  fprintf(stderr, "%s: command not found\n", command);
+    fprintf(stderr, "%s: command not found\n", command);
+  }
 
   return 0;
 }
