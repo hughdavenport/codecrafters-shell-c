@@ -9,4 +9,4 @@
 # Exit early if any commands fail
 set -e
 
-gcc app/*.c -o /tmp/shell-target
+gcc -ggdb -fsanitize=address -Wall -Wpedantic app/*.c -o /tmp/shell-target
