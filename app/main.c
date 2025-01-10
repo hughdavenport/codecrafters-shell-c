@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define UNIMPLENTED(msg) do { fprintf(stderr, "%s:%d: UNIMPLENTED: %s", __FILE__, __LINE__, msg); exit(1); } while (false)
 #define UNREACHABLE(msg) do { fprintf(stderr, "%s:%d: UNREACHABLE", __FILE__, __LINE__); exit(1); } while (false)
@@ -94,7 +95,7 @@ int echo_command(char *command, char *rest, char *delim) {
 int type_command(char *command, char *rest, char *delim) {
   char *arg = NULL;
   int ret = 0;
-  while ((arg = read_arg(rest, delim, &rest)) != NULL) {;
+  while ((arg = read_arg(rest, delim, &rest)) != NULL) {
     bool found = false;
     for (size_t i = 0; i < builtins.size; i ++) {
       if (strcmp(arg, builtins.data[i].command) == 0) {
@@ -103,14 +104,43 @@ int type_command(char *command, char *rest, char *delim) {
         break;
       }
     }
-    if (!found) {
-      // FIXME do PATH things
+    if (found) {
+      free(arg);
+      continue;
+    }
 
-      if (!found) {
-        printf("%s: not found\n", arg);
-        ret = 1;
+    if (strchr(arg, '/') != NULL && access(arg, R_OK | X_OK) == 0) {
+      printf("%s is %s\n", arg, arg);
+      free(arg);
+      continue;
+    }
+
+    char *path = getenv("PATH");
+    if (path != NULL) {
+      char *p = path;
+      while (*p != '\0') {
+        while (*p != '\0' && *p != ':') p ++;
+        char *file_path = NULL;
+        char *path_name = strndup(path, (int)(p - path));
+        assert(asprintf(&file_path, "%s/%s", path_name, arg) != 0);
+        free(path_name);
+        if (access(file_path, R_OK | X_OK) == 0) {
+          printf("%s is %s\n", arg, file_path);
+          free(file_path);
+          found = true;
+          break;
+        }
+        if (*p != '\0') path = ++p;
+        free(file_path);
       }
     }
+    if (found) {
+      free(arg);
+      continue;
+    }
+
+    ret = 1;
+    printf("%s: not found\n", arg);
     free(arg);
   }
 
