@@ -74,9 +74,10 @@ int main(int argc, char **argv) {
         printf("%s", arg);
       }
       printf("\n");
+    } else {
+      fprintf(stderr, "%s: command not found\n", command);
     }
 
-    fprintf(stderr, "%s: command not found\n", command);
     free(command);
   }
 
