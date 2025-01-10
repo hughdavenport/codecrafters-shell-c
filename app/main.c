@@ -64,6 +64,16 @@ int main(int argc, char **argv) {
       free(arg);
       free(command);
       exit(code);
+    } else if (strcmp(command, "echo") == 0) {
+      // Get each argument
+      char *arg = NULL;
+      bool first = true;
+      while ((arg = read_arg(rest, delim, &rest)) != NULL) {
+        if (!first) printf(" ");
+        else first = false;
+        printf("%s", arg);
+      }
+      printf("\n");
     }
 
     fprintf(stderr, "%s: command not found\n", command);
