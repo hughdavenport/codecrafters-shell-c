@@ -1,6 +1,29 @@
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define UNIMPLENTED(msg) do { fprintf(stderr, "%s:%d: UNIMPLENTED: %s", __FILE__, __LINE__, msg); exit(1); } while (false)
+
+char *read_arg(char *string, const char *delim, char **rest) {
+  // Strip delim from start
+  char *start = string;
+  while (*start != '\0' && *start != '\n' && strchr(delim, *start) != NULL) start ++;
+
+  char *p = start;
+  if (*start == '\0') return NULL;
+  if (*start == '\n') return NULL;
+
+  if (*p == '"') {
+    UNIMPLENTED("Double quoted arguments");
+  } else if (*p == '\'') {
+    UNIMPLENTED("Single quoted arguments");
+  } else {
+    while (*p != '\0' && *p != '\n' && strchr(delim, *p) == NULL) p ++;
+    *rest = p;
+    return strndup(start, p - start);
+  }
+}
 
 int main(int argc, char **argv) {
   // Flush after every printf
@@ -18,9 +41,13 @@ int main(int argc, char **argv) {
     if (fgets(input, 100, stdin) == NULL) break;
 
     char *delim = " \n";
-    char *command = strtok(input, delim);
+    char *rest = NULL;
+    char *command = read_arg(input, delim, &rest);
+    if (command == NULL) continue;
+
     if (strcmp(command, "exit") == 0) {
-      char *arg = strtok(NULL, delim);
+      char *arg = read_arg(rest, delim, &rest);
+
       int code = 0;
       if (arg != NULL) {
         char *end;
@@ -34,10 +61,13 @@ int main(int argc, char **argv) {
           continue;
         }
       }
+      free(arg);
+      free(command);
       exit(code);
     }
 
     fprintf(stderr, "%s: command not found\n", command);
+    free(command);
   }
 
   return 0;
