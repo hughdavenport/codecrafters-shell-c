@@ -91,9 +91,36 @@ int echo_command(char *command, char *rest, char *delim) {
   return 0;
 }
 
+int type_command(char *command, char *rest, char *delim) {
+  char *arg = NULL;
+  int ret = 0;
+  while ((arg = read_arg(rest, delim, &rest)) != NULL) {;
+    bool found = false;
+    for (size_t i = 0; i < builtins.size; i ++) {
+      if (strcmp(arg, builtins.data[i].command) == 0) {
+        printf("%s is a shell builtin\n", arg);
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      // FIXME do PATH things
+
+      if (!found) {
+        printf("%s: not found\n", arg);
+        ret = 1;
+      }
+    }
+    free(arg);
+  }
+
+  return ret;
+}
+
 int main(int argc, char **argv) {
-  ARRAY_ADD(builtins, COMMAND(echo));
   ARRAY_ADD(builtins, COMMAND(exit));
+  ARRAY_ADD(builtins, COMMAND(echo));
+  ARRAY_ADD(builtins, COMMAND(type));
   // Flush after every printf
   setbuf(stdout, NULL);
   char *program_path = argv[0];
@@ -116,8 +143,8 @@ int main(int argc, char **argv) {
     int code = -1;
     for (size_t i = 0; i < builtins.size; i ++) {
       if (strcmp(command, builtins.data[i].command) == 0) {
-        // FIXME store return value
         free(command);
+        // FIXME store return value
         code = builtins.data[i].function(program, rest, delim);
         break;
       }
@@ -128,5 +155,6 @@ int main(int argc, char **argv) {
     }
   }
 
+  free(builtins.data);
   return 0;
 }
