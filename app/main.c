@@ -254,41 +254,31 @@ int cd_command(char *command, char *rest, char *delim) {
     switch (arg[1]) {
       case '\0': {
         free(arg);
-        uid_t me = getuid();
-        while ((passwd = getpwent()) != NULL) {
-          if (passwd->pw_uid == me) {
-            setpwent();
-            endpwent();
-            return cd(passwd->pw_dir);
-          }
+        char *home = getenv("HOME");
+        if (home == NULL) {
+          printf("cd: HOME not set\n");
+          return 1;
         }
-        setpwent();
-        endpwent();
-        UNREACHABLE();
+        return cd(home);
       }; break;
 
       case '/': {
-        uid_t me = getuid();
-        while ((passwd = getpwent()) != NULL) {
-          if (passwd->pw_uid == me) {
-            setpwent();
-            endpwent();
-            size_t len = strlen(passwd->pw_dir);
-            size_t arg_len = strlen(arg + 1);
-            char *full_path = malloc(len + arg_len + 1);
-            assert(full_path != NULL);
-            strcpy(full_path, passwd->pw_dir);
-            strcpy(full_path + len, arg + 1);
-            full_path[len + arg_len] = '\0';
-            free(arg);
-            int ret = cd(full_path);
-            free(full_path);
-            return ret;
-          }
+        char *home = getenv("HOME");
+        if (home == NULL) {
+          printf("cd: HOME not set\n");
+          return 1;
         }
-        setpwent();
-        endpwent();
-        UNREACHABLE();
+        size_t len = strlen(home);
+        size_t arg_len = strlen(arg + 1);
+        char *full_path = malloc(len + arg_len + 1);
+        assert(full_path != NULL);
+        strcpy(full_path, home);
+        strcpy(full_path + len, arg + 1);
+        full_path[len + arg_len] = '\0';
+        free(arg);
+        int ret = cd(full_path);
+        free(full_path);
+        return ret;
       }; break;
 
       default: {
