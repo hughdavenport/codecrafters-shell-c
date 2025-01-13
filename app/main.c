@@ -6,6 +6,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <sys/wait.h>
+
 #define UNIMPLENTED(msg) do { fprintf(stderr, "%s:%d: UNIMPLENTED: %s", __FILE__, __LINE__, msg); exit(1); } while (false)
 #define UNREACHABLE(msg) do { fprintf(stderr, "%s:%d: UNREACHABLE", __FILE__, __LINE__); exit(1); } while (false)
 
@@ -161,6 +163,42 @@ int type_command(char *command, char *rest, char *delim) {
   return ret;
 }
 
+extern char **environ;
+int run_program(char *file_path, char *command, char *rest, char *delim) {
+  ARRAY(char *) argv = {0};
+  ARRAY_ADD(argv, command);
+  char *arg;
+  while ((arg = read_arg(rest, delim, &rest)) != NULL) {
+    ARRAY_ADD(argv, arg);
+  }
+
+  ARRAY_ADD(argv, NULL);
+  pid_t pid = fork();
+  switch (pid) {
+    case -1:
+      assert(false && "Out of memory");
+      UNREACHABLE();
+      return -1;
+
+    case 0:
+      assert(execve(file_path, argv.data, environ) != -1);
+      UNREACHABLE();
+      return -1;
+
+    default: {
+      int wstatus = 0;
+      assert(waitpid(pid, &wstatus, 0) != -1);
+      for (size_t i = 1; i < argv.size; i ++) {
+        free(argv.data[i]);
+      }
+      free(argv.data);
+      return WEXITSTATUS(wstatus);
+    }
+  }
+  UNREACHABLE();
+  return -1;
+}
+
 int main(int argc, char **argv) {
   ARRAY_ADD(builtins, COMMAND(exit, "Exit the shell, with optional code."));
   ARRAY_ADD(builtins, COMMAND(echo, "Prints any arguments to stdout."));
@@ -196,8 +234,36 @@ int main(int argc, char **argv) {
       }
     }
     if (code == -1) {
-      fprintf(stderr, "%s: command not found\n", command);
-      free(command);
+      if (strchr(command, '/') != NULL && access(command, R_OK | X_OK) == 0) {
+        code = run_program(command, command, rest, delim);
+
+        free(command);
+        continue;
+      }
+
+      char *path = getenv("PATH");
+      if (path != NULL) {
+        char *p = path;
+        while (*p != '\0') {
+          while (*p != '\0' && *p != ':') p ++;
+          char *file_path = NULL;
+          char *path_name = strndup(path, (int)(p - path));
+          assert(asprintf(&file_path, "%s/%s", path_name, command) != 0);
+          free(path_name);
+          if (access(file_path, R_OK | X_OK) == 0) {
+            code = run_program(file_path, command, rest, delim);
+            free(file_path);
+            break;
+          }
+          if (*p != '\0') path = ++p;
+          free(file_path);
+        }
+      }
+
+      if (code == -1) {
+        fprintf(stderr, "%s: command not found\n", command);
+        free(command);
+      }
     }
   }
 
