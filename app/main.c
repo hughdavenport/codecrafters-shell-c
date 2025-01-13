@@ -163,6 +163,14 @@ int type_command(char *command, char *rest, char *delim) {
   return ret;
 }
 
+int pwd_command(char *command, char *rest, char *delim) {
+  char buf[4096] = {0};
+  char *cwd = getcwd(buf, 4096);
+  assert(cwd != NULL);
+  printf("%s\n", cwd);
+  return 0;
+}
+
 extern char **environ;
 int run_program(char *file_path, char *command, char *rest, char *delim) {
   ARRAY(char *) argv = {0};
@@ -203,6 +211,7 @@ int main(int argc, char **argv) {
   ARRAY_ADD(builtins, COMMAND(exit, "Exit the shell, with optional code."));
   ARRAY_ADD(builtins, COMMAND(echo, "Prints any arguments to stdout."));
   ARRAY_ADD(builtins, COMMAND(type, "Prints the type of command arguments."));
+  ARRAY_ADD(builtins, COMMAND(pwd, "Prints current working directory."));
   ARRAY_ADD(builtins, COMMAND(help, "Displays help about commands."));
 
   // Flush after every printf
