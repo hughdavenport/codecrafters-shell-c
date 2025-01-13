@@ -262,6 +262,7 @@ int main(int argc, char **argv) {
           if (access(file_path, R_OK | X_OK) == 0) {
             code = run_program(file_path, command, rest, delim);
             free(file_path);
+            free(command);
             break;
           }
           if (*p != '\0') path = ++p;
