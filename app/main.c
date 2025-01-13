@@ -45,24 +45,100 @@ struct { \
 
 ARRAY(command_t) builtins = {0};
 
-char *read_arg(char *string, const char *delim, char **rest) {
+char *read_arg(char *command, char *string, const char *delim, char **rest) {
+#define ERROR(msg) fprintf(stderr, "%s: %s\n", (fmt))
   // Strip delim from start
   char *start = string;
-  while (*start != '\0' && *start != '\n' && strchr(delim, *start) != NULL) start ++;
+  while (*start != '\0' && strchr(delim, *start) != NULL) start ++;
 
   char *p = start;
-  if (*start == '\0') return NULL;
-  if (*start == '\n') return NULL;
+  switch (*p) {
+    case '\0':
+    case '\n':
+      return NULL;
 
-  if (*p == '"') {
-    UNIMPLENTED("Double quoted arguments");
-  } else if (*p == '\'') {
-    UNIMPLENTED("Single quoted arguments");
-  } else {
-    while (*p != '\0' && *p != '\n' && strchr(delim, *p) == NULL) p ++;
-    *rest = p;
-    return strndup(start, p - start);
+    case '"': {
+      UNIMPLENTED("Double quoted arguments");
+    }; break;
+
+    case '\'': {
+      UNIMPLENTED("Single quoted arguments");
+    }; break;
+
+    case '~': {
+      p ++;
+      struct passwd *passwd = NULL;
+
+      if (*p == '\0' || strchr(delim, *p) != NULL) {
+        *rest = p;
+        char *home = getenv("HOME");
+        if (home == NULL) {
+          return strdup("~");
+        }
+        return strdup(home);
+      }
+
+      switch (*p) {
+        case '/': {
+          // FIXME check for quotes
+          while (*p != '\0' && *p != '\n' && strchr(delim, *p) == NULL) p ++;
+          *rest = p;
+          char *home = getenv("HOME");
+          if (home == NULL) {
+            return strndup(start, p - start);
+          }
+          size_t len = strlen(home);
+          size_t arg_len = p - start - 1;
+          char *full_path = malloc(len + arg_len + 1);
+          assert(full_path != NULL);
+          strcpy(full_path, home);
+          strncpy(full_path + len, start + 1, arg_len);
+          full_path[len + arg_len] = '\0';
+          return full_path;
+        }; break;
+
+        default: {
+          // ~user
+          while ((passwd = getpwent()) != NULL) {
+            size_t len = strlen(passwd->pw_name);
+            if (strncmp(p, passwd->pw_name, len) == 0) {
+              setpwent();
+              endpwent();
+              p += len;
+              if (*p == '\0' || strchr(delim, *p) != NULL) {
+                *rest = p;
+                return strdup(passwd->pw_dir);
+              }
+
+              if (*p == '/') {
+                start = p;
+                while (*p != '\0' && *p != '\n' && strchr(delim, *p) == NULL) p ++;
+                *rest = p;
+                size_t dir_len = strlen(passwd->pw_dir);
+                size_t arg_len = p - start;
+                char *full_path = malloc(dir_len + arg_len + 1);
+                assert(full_path != NULL);
+                strcpy(full_path, passwd->pw_dir);
+                strncpy(full_path + dir_len, start, arg_len);
+                full_path[dir_len + arg_len] = '\0';
+                return full_path;
+              }
+            }
+          }
+          setpwent();
+          endpwent();
+          // Haven't found user, fall out to normal cd
+        }; break;
+      }
+      p = start;
+    }; // fall through to default
+    default:
+      // FIXME check for quotes
+      while (*p != '\0' && *p != '\n' && strchr(delim, *p) == NULL) p ++;
+      *rest = p;
+      return strndup(start, p - start);
   }
+#undef ERROR
 }
 
 extern char **environ;
@@ -70,7 +146,7 @@ int run_program(char *file_path, char *command, char *rest, char *delim) {
   ARRAY(char *) argv = {0};
   ARRAY_ADD(argv, command);
   char *arg;
-  while ((arg = read_arg(rest, delim, &rest)) != NULL) {
+  while ((arg = read_arg(command, rest, delim, &rest)) != NULL) {
     ARRAY_ADD(argv, arg);
   }
 
@@ -112,7 +188,7 @@ int help_command(char *command, char *rest, char *delim) {
 }
 
 int exit_command(char *command, char *rest, char *delim) {
-  char *arg = read_arg(rest, delim, &rest);
+  char *arg = read_arg(command, rest, delim, &rest);
 
   int code = 0;
   if (arg != NULL) {
@@ -138,7 +214,7 @@ int echo_command(char *command, char *rest, char *delim) {
   // Get each argument
   char *arg = NULL;
   bool first = true;
-  while ((arg = read_arg(rest, delim, &rest)) != NULL) {
+  while ((arg = read_arg(command, rest, delim, &rest)) != NULL) {
     if (!first) printf(" ");
     else first = false;
     printf("%s", arg);
@@ -151,7 +227,7 @@ int echo_command(char *command, char *rest, char *delim) {
 int type_command(char *command, char *rest, char *delim) {
   char *arg = NULL;
   int ret = 0;
-  while ((arg = read_arg(rest, delim, &rest)) != NULL) {
+  while ((arg = read_arg(command, rest, delim, &rest)) != NULL) {
     bool found = false;
     for (size_t i = 0; i < builtins.size; i ++) {
       if (strcmp(arg, builtins.data[i].command) == 0) {
@@ -232,7 +308,7 @@ int cd(char *file_path) {
 }
 
 int cd_command(char *command, char *rest, char *delim) {
-  char *arg = read_arg(rest, delim, &rest);
+  char *arg = read_arg(command, rest, delim, &rest);
   if (arg == NULL) {
     char *home = getenv("HOME");
     if (home == NULL) {
@@ -242,80 +318,13 @@ int cd_command(char *command, char *rest, char *delim) {
     return cd(home);
   }
 
-  char *next = read_arg(rest, delim, &rest);
+  char *next = read_arg(command, rest, delim, &rest);
   if (next != NULL) {
     printf("cd: too many arguments\n");
     return 1;
   }
 
-  int ret = 0;
-  if (arg[0] == '~') {
-    struct passwd *passwd = NULL;
-    switch (arg[1]) {
-      case '\0': {
-        free(arg);
-        char *home = getenv("HOME");
-        if (home == NULL) {
-          printf("cd: HOME not set\n");
-          return 1;
-        }
-        return cd(home);
-      }; break;
-
-      case '/': {
-        char *home = getenv("HOME");
-        if (home == NULL) {
-          printf("cd: HOME not set\n");
-          return 1;
-        }
-        size_t len = strlen(home);
-        size_t arg_len = strlen(arg + 1);
-        char *full_path = malloc(len + arg_len + 1);
-        assert(full_path != NULL);
-        strcpy(full_path, home);
-        strcpy(full_path + len, arg + 1);
-        full_path[len + arg_len] = '\0';
-        free(arg);
-        int ret = cd(full_path);
-        free(full_path);
-        return ret;
-      }; break;
-
-      default: {
-        // ~user
-        while ((passwd = getpwent()) != NULL) {
-          size_t len = strlen(passwd->pw_name);
-          if (strncmp(arg + 1, passwd->pw_name, len) == 0) {
-            setpwent();
-            endpwent();
-            switch (arg[len + 1]) {
-              case '\0':
-                free(arg);
-                return cd(passwd->pw_dir);
-
-              case '/': {
-                size_t dir_len = strlen(passwd->pw_dir);
-                size_t arg_len = strlen(arg + len + 1);
-                char *full_path = malloc(dir_len + arg_len + 1);
-                assert(full_path != NULL);
-                strcpy(full_path, passwd->pw_dir);
-                strcpy(full_path + dir_len, arg + len + 1);
-                full_path[len + arg_len] = '\0';
-                free(arg);
-                ret = cd(full_path);
-                free(full_path);
-                return ret;
-              }
-            }
-          }
-        }
-        setpwent();
-        endpwent();
-        // Haven't found user, fall out to normal cd
-      }; break;
-    }
-  }
-  ret = cd(arg);
+  int ret = cd(arg);
   free(arg);
   return ret;
 }
@@ -344,7 +353,7 @@ int main(int argc, char **argv) {
 
     char *delim = " \n";
     char *rest = NULL;
-    char *command = read_arg(input, delim, &rest);
+    char *command = read_arg(NULL, input, delim, &rest);
     if (command == NULL) continue;
 
     int code = -1;
