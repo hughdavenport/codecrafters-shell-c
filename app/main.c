@@ -11,10 +11,15 @@
 
 typedef struct {
   char *command;
+  char *description;
   int (*function)(char *program, char *rest, char *delim);
 } command_t;
 
-#define COMMAND(name) (command_t){ .command = #name, .function = name ## _command }
+#define COMMAND(name, desc) (command_t){ \
+    .command = #name, \
+    .description = (desc), \
+    .function = name ## _command \
+}
 
 #define ARRAY(X) \
 struct { \
@@ -92,6 +97,15 @@ int echo_command(char *command, char *rest, char *delim) {
   return 0;
 }
 
+int help_command(char *command, char *rest, char *delim) {
+    printf("Available commands:\n");
+    for (size_t i = 0; i < builtins.size; i ++) {
+      command_t cmd = builtins.data[i];
+      printf("    %-10s - %s\n", cmd.command, cmd.description);
+    }
+    return 0;
+}
+
 int type_command(char *command, char *rest, char *delim) {
   char *arg = NULL;
   int ret = 0;
@@ -148,9 +162,11 @@ int type_command(char *command, char *rest, char *delim) {
 }
 
 int main(int argc, char **argv) {
-  ARRAY_ADD(builtins, COMMAND(exit));
-  ARRAY_ADD(builtins, COMMAND(echo));
-  ARRAY_ADD(builtins, COMMAND(type));
+  ARRAY_ADD(builtins, COMMAND(exit, "Exit the shell, with optional code."));
+  ARRAY_ADD(builtins, COMMAND(echo, "Prints any arguments to stdout."));
+  ARRAY_ADD(builtins, COMMAND(type, "Prints the type of command arguments."));
+  ARRAY_ADD(builtins, COMMAND(help, "Displays help about commands."));
+
   // Flush after every printf
   setbuf(stdout, NULL);
   char *program_path = argv[0];
