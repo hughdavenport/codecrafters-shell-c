@@ -27,12 +27,20 @@ struct { \
   X *data; \
 }
 
+#define ARRAY_ENSURE_CAPACITY(arr, cap) do { \
+  if ((cap) > (arr).capacity) { \
+    (arr).data = realloc((arr).data, sizeof((arr).data[0]) * (cap)); \
+    assert((arr).data != NULL); \
+    memset((arr).data + sizeof((arr).data[0]) * (arr).capacity, \
+        '\0', sizeof((arr).data[0]) * ((cap) - (arr).capacity)); \
+    (arr).capacity = (cap); \
+  } \
+} while (false)
+
 #define ARRAY_ADD(arr, value) do { \
   if ((arr).size + 1 > (arr).capacity) { \
     size_t new_capacity = (arr).capacity == 0 ? 16 : (arr).capacity * 2; \
-    (arr).data = realloc((arr).data, sizeof((arr).data[0]) * new_capacity); \
-    assert((arr).data != NULL); \
-    (arr).capacity = new_capacity; \
+    ARRAY_ENSURE_CAPACITY((arr), (new_capacity)); \
   } \
   (arr).data[(arr).size ++] = (value); \
 } while (false)
@@ -60,12 +68,36 @@ typedef struct {
 }
 
 ARRAY(command_t) builtins = {0};
+ARRAY(FILE *) files = {0};
 
-char *_read_arg(char *string, const char *delim, char **rest) {
+void close_open_files() {
+  for (size_t i = 0; i < files.size; i ++) {
+    if (files.data[i] != NULL) {
+      fclose(files.data[i]);
+      files.data[i] = NULL;
+    }
+  }
+}
+
+char *_read_arg(char *string, const char *delim, char **rest, bool *quoted) {
   ARRAY(char) ret = {0};
   char *p = string;
   quote_mode quote = UNQUOTED;
   while (*p != '\0' && (quote != UNQUOTED || strchr(delim, *p) == NULL)) {
+    if (quote == UNQUOTED && *p == '>') {
+      if (p == string) {
+        ARRAY_ADD(ret, '>');
+        p ++;
+        if (*p == '>') {
+          ARRAY_ADD(ret, '>');
+          p ++;
+        }
+      }
+      *rest = p;
+      ARRAY_ADD(ret, '\0');
+      return ret.data;
+    }
+
     switch (*p) {
       case '\\': {
         switch (quote) {
@@ -105,6 +137,7 @@ char *_read_arg(char *string, const char *delim, char **rest) {
         switch (quote) {
           case UNQUOTED:
             quote = DOUBLE;
+            *quoted = true;
             break;
 
           case SINGLE:
@@ -125,6 +158,7 @@ char *_read_arg(char *string, const char *delim, char **rest) {
         switch (quote) {
           case UNQUOTED:
             quote = SINGLE;
+            *quoted = true;
             break;
 
           case SINGLE:
@@ -153,7 +187,7 @@ char *_read_arg(char *string, const char *delim, char **rest) {
   return ret.data;
 }
 
-char *read_tilde_arg(char *string, const char *delim, char **rest) {
+char *read_tilde_arg(char *string, const char *delim, char **rest, bool *quoted) {
   char *p = string + 1;
   struct passwd *passwd = NULL;
 
@@ -168,7 +202,7 @@ char *read_tilde_arg(char *string, const char *delim, char **rest) {
 
   switch (*p) {
     case '/': {
-      char *arg = _read_arg(p, delim, rest);
+      char *arg = _read_arg(p, delim, rest, quoted);
       char *home = getenv("HOME");
       if (home == NULL) {
         size_t arg_len = strlen(arg);
@@ -206,7 +240,7 @@ char *read_tilde_arg(char *string, const char *delim, char **rest) {
           }
 
           if (*p == '/') {
-            char *arg = _read_arg(p, delim, rest);
+            char *arg = _read_arg(p, delim, rest, quoted);
             size_t dir_len = strlen(passwd->pw_dir);
             size_t arg_len = strlen(arg);
             char *full_path = malloc(dir_len + arg_len + 1);
@@ -224,10 +258,11 @@ char *read_tilde_arg(char *string, const char *delim, char **rest) {
       // Haven't found user, fall out
     }; break;
   }
-  return _read_arg(string, delim, rest);
+  return _read_arg(string, delim, rest, quoted);
 }
 
-char *read_arg(char *string, const char *delim, char **rest) {
+char *read_arg(char *string, const char *delim, char **rest, bool *quoted) {
+  *quoted = false;
   char *start = string;
   while (*start != '\0' && strchr(delim, *start) != NULL) start ++;
 
@@ -236,9 +271,9 @@ char *read_arg(char *string, const char *delim, char **rest) {
   }
 
   if (*start == '~') {
-    return read_tilde_arg(start, delim, rest);
+    return read_tilde_arg(start, delim, rest, quoted);
   } else {
-    return _read_arg(start, delim, rest);
+    return _read_arg(start, delim, rest, quoted);
   }
 }
 
@@ -257,6 +292,12 @@ int run_program(char *file_path, string_array args) {
       return -1;
 
     case 0:
+      for (size_t i = 0; i < files.size; i ++) {
+        if (files.data[i] != NULL) {
+          int fd = fileno(files.data[i]);
+          assert(dup2(fd, i) == i);
+        }
+      }
       assert(execve(file_path, argv.data, environ) != -1);
       UNREACHABLE();
       return -1;
@@ -274,37 +315,52 @@ int run_program(char *file_path, string_array args) {
 
 
 int help_command(string_array args) {
+  FILE *out = stdout;
+  if (files.size > STDOUT_FILENO && files.data[STDOUT_FILENO] != NULL) {
+    out = files.data[STDOUT_FILENO];
+  }
+  FILE *err = stdout;
+  if (files.size > STDERR_FILENO && files.data[STDERR_FILENO] != NULL) {
+    err = files.data[STDERR_FILENO];
+  }
+
   if (args.size > 1) {
     char *arg = args.data[1];
     for (size_t i = 0; i < builtins.size; i ++) {
       command_t cmd = builtins.data[i];
       if (strcmp(cmd.command, arg) == 0) {
-        printf("    %-10s - %s\n", cmd.command, cmd.description);
+
+        fprintf(out, "    %-10s - %s\n", cmd.command, cmd.description);
         return 0;
       }
     }
-    fprintf(stderr, "%s: Builtin %s not found\n", args.data[0], args.data[1]);
+    fprintf(err, "%s: Builtin %s not found\n", args.data[0], args.data[1]);
     return 1;
   }
-  printf("Available commands:\n");
+  fprintf(out, "Available commands:\n");
   for (size_t i = 0; i < builtins.size; i ++) {
     command_t cmd = builtins.data[i];
-    printf("    %-10s - %s\n", cmd.command, cmd.description);
+    fprintf(out, "    %-10s - %s\n", cmd.command, cmd.description);
   }
   return 0;
 }
 
 int exit_command(string_array args) {
+  FILE *err = stdout;
+  if (files.size > STDERR_FILENO && files.data[STDERR_FILENO] != NULL) {
+    err = files.data[STDERR_FILENO];
+  }
+
   int code = 0;
   if (args.size > 1) {
     char *end;
     code = strtol(args.data[1], &end, 0);
     if (*end != '\0') {
-      fprintf(stderr, "%s: numeric argument required\n", args.data[0]);
+      fprintf(err, "%s: numeric argument required\n", args.data[0]);
       return 1;
     }
     if (code < 0 || code > 255) {
-      fprintf(stderr, "%s: exit code must be 0-255\n", args.data[0]);
+      fprintf(err, "%s: exit code must be 0-255\n", args.data[0]);
       return 1;
     }
   }
@@ -313,6 +369,8 @@ int exit_command(string_array args) {
     args.data[i] = NULL;
   }
   ARRAY_FREE(args);
+  close_open_files();
+  ARRAY_FREE(files);
   ARRAY_FREE(builtins);
   exit(code);
   UNREACHABLE();
@@ -320,22 +378,36 @@ int exit_command(string_array args) {
 }
 
 int echo_command(string_array args) {
-  for (size_t i = 1; i < args.size; i ++) {
-    if (i > 1) printf(" ");
-    printf("%s", args.data[i]);
+  FILE *out = stdout;
+  if (files.size > STDOUT_FILENO && files.data[STDOUT_FILENO] != NULL) {
+    out = files.data[STDOUT_FILENO];
   }
-  printf("\n");
+
+  for (size_t i = 1; i < args.size; i ++) {
+    if (i > 1) fprintf(out, " ");
+    fprintf(out, "%s", args.data[i]);
+  }
+  fprintf(out, "\n");
   return 0;
 }
 
 int type_command(string_array args) {
+  FILE *out = stdout;
+  if (files.size > STDOUT_FILENO && files.data[STDOUT_FILENO] != NULL) {
+    out = files.data[STDOUT_FILENO];
+  }
+  FILE *err = stdout;
+  if (files.size > STDERR_FILENO && files.data[STDERR_FILENO] != NULL) {
+    err = files.data[STDERR_FILENO];
+  }
+
   int ret = 0;
   for (size_t i = 1; i < args.size; i ++) {
     char *arg = args.data[i];
     bool found = false;
     for (size_t b_i = 0; b_i < builtins.size; b_i ++) {
       if (strcmp(arg, builtins.data[b_i].command) == 0) {
-        printf("%s is a shell builtin\n", arg);
+        fprintf(out, "%s is a shell builtin\n", arg);
         found = true;
         break;
       }
@@ -345,7 +417,7 @@ int type_command(string_array args) {
     }
 
     if (strchr(arg, '/') != NULL && access(arg, R_OK | X_OK) == 0) {
-      printf("%s is %s\n", arg, arg);
+      fprintf(out, "%s is %s\n", arg, arg);
       continue;
     }
 
@@ -359,7 +431,7 @@ int type_command(string_array args) {
         assert(asprintf(&file_path, "%s/%s", path_name, arg) != 0);
         free(path_name);
         if (access(file_path, R_OK | X_OK) == 0) {
-          printf("%s is %s\n", arg, file_path);
+          fprintf(out, "%s is %s\n", arg, file_path);
           free(file_path);
           found = true;
           break;
@@ -373,17 +445,22 @@ int type_command(string_array args) {
     }
 
     ret = 1;
-    printf("%s: not found\n", arg);
+    fprintf(err, "%s: not found\n", arg);
   }
 
   return ret;
 }
 
 int pwd_command(string_array args) {
+  FILE *out = stdout;
+  if (files.size > STDOUT_FILENO && files.data[STDOUT_FILENO] != NULL) {
+    out = files.data[STDOUT_FILENO];
+  }
+
   char buf[4096] = {0};
   char *cwd = getcwd(buf, 4096);
   assert(cwd != NULL);
-  printf("%s\n", cwd);
+  fprintf(out, "%s\n", cwd);
   return 0;
 }
 
@@ -409,15 +486,20 @@ int cd(char *file_path) {
 }
 
 int cd_command(string_array args) {
+  FILE *err = stdout;
+  if (files.size > STDERR_FILENO && files.data[STDERR_FILENO] != NULL) {
+    err = files.data[STDERR_FILENO];
+  }
+
   if (args.size > 2) {
-    fprintf(stderr, "cd: too many arguments\n");
+    fprintf(err, "cd: too many arguments\n");
     return 1;
   }
 
   if (args.size == 1) {
     char *home = getenv("HOME");
     if (home == NULL) {
-      fprintf(stderr, "cd: HOME not set\n");
+      fprintf(err, "cd: HOME not set\n");
       return 1;
     }
     return cd(home);
@@ -446,12 +528,49 @@ int main(int argc, char **argv) {
 
     char *delim = " \n";
     string_array args = {0};
+    bool error = false;
     char *rest = input;
     char *arg;
-    while ((arg = read_arg(rest, delim, &rest)) != NULL) {
-      ARRAY_ADD(args, arg);
+    bool quoted;
+    while ((arg = read_arg(rest, delim, &rest, &quoted)) != NULL) {
+      if (!quoted && (strcmp(arg, ">") == 0 || strcmp(arg, ">>") == 0)) {
+
+        long fd = STDOUT_FILENO;
+        if (args.size > 0) {
+          char *end;
+          long test = strtol(args.data[args.size - 1], &end, 0);
+          if (arg != end && *end == '\0') {
+            fd = test;
+            args.size --;
+            free(args.data[args.size]);
+            args.data[args.size] = NULL;
+          }
+        }
+        bool append = arg[1] == '>';
+        free(arg);
+        if (fd < 0) {
+          fprintf(stderr, "redirection error, negative file descriptor\n");
+          error = true;
+          break;
+        }
+
+        arg = read_arg(rest, delim, &rest, &quoted);
+        if (arg == NULL) {
+          fprintf(stderr, "syntax error, missing filename of redirect\n");
+          error = true;
+          break;
+        }
+
+        ARRAY_ENSURE_CAPACITY(files, fd + 1);
+        if (fd >= files.size) files.size = fd + 1;
+        files.data[fd] = fopen(arg, append ? "a" : "w");
+        free(arg);
+      } else {
+        ARRAY_ADD(args, arg);
+      }
     }
-    if (args.size == 0) continue;
+    if (error) goto cont;
+    if (args.size == 0) goto cont;
     char *command = args.data[0];
 
     int code = -1;
@@ -491,6 +610,24 @@ int main(int argc, char **argv) {
         }
       }
     }
+cont:
+    for (size_t i = 0; i < files.size; i ++ ) {
+      if (files.data[i] != NULL) {
+        fflush(files.data[i]);
+      }
+    }
+    if (files.size > STDIN_FILENO && files.data[STDIN_FILENO] != NULL) {
+      fclose(files.data[STDIN_FILENO]);
+      files.data[STDIN_FILENO] = NULL;
+    }
+    if (files.size > STDOUT_FILENO && files.data[STDOUT_FILENO] != NULL) {
+      fclose(files.data[STDOUT_FILENO]);
+      files.data[STDOUT_FILENO] = NULL;
+    }
+    if (files.size > STDERR_FILENO && files.data[STDERR_FILENO] != NULL) {
+      fclose(files.data[STDERR_FILENO]);
+      files.data[STDERR_FILENO] = NULL;
+    }
     for (size_t i = 0; i < args.size; i ++) {
       free(args.data[i]);
       args.data[i] = NULL;
@@ -498,6 +635,8 @@ int main(int argc, char **argv) {
     ARRAY_FREE(args);
   }
 
+  close_open_files();
+  ARRAY_FREE(files);
   ARRAY_FREE(builtins);
   return 0;
 }
