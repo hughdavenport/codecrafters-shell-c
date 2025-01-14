@@ -1,34 +1,14 @@
 [![progress-banner](https://backend.codecrafters.io/progress/shell/e695225e-4898-43d6-8343-b3e46e32d1c7)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+[![patreon](https://img.shields.io/badge/patreon-FF5441?style=for-the-badge&logo=Patreon)](https://www.patreon.com/hughdavenport)
+[![youtube](https://img.shields.io/badge/youtube-FF0000?style=for-the-badge&logo=youtube)](https://www.youtube.com/playlist?list=PL5r5Q39GjMDe5UslVzi2MHcbvkTLw9Pav)
 
-This is a starting point for C solutions to the
-["Build Your Own Shell" Challenge](https://app.codecrafters.io/courses/shell/overview).
-
-In this challenge, you'll build your own POSIX compliant shell that's capable of
-interpreting shell commands, running external programs and builtin commands like
-cd, pwd, echo and more. Along the way, you'll learn about shell command parsing,
-REPLs, builtin commands, and more.
+This is a repository for my solutions to the
+["Build Your Own Shell" Challenge](https://app.codecrafters.io/courses/shell/overview) in C. You can see my progress above.
+You can also watch a [YouTube series](https://www.youtube.com/playlist?list=PL5r5Q39GjMDe5UslVzi2MHcbvkTLw9Pav) where I discuss and code the solutions.
 
 **Note**: If you're viewing this repo on GitHub, head over to
 [codecrafters.io](https://codecrafters.io) to try the challenge.
 
-# Passing the first stage
+# Running the program
 
-The entry point for your `shell` implementation is in `app/main.c`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
-
-```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
-```
-
-Time to move on to the next stage!
-
-# Stage 2 & beyond
-
-Note: This section is for stages 2 and beyond.
-
-1. Ensure you have `c (9.2)` installed locally
-1. Run `./your_program.sh` to run your program, which is implemented in
-   `app/main.c`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
+The entry point for your shell implementation is in `app/main.c`, but you can compile and run it with `your_program.sh`, or `.codecrafters/debug.sh` if you want to go step by step.
