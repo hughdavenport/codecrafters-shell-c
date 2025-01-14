@@ -15,7 +15,7 @@
 #define UNREACHABLE(msg) do { fprintf(stderr, "%s:%d: UNREACHABLE", __FILE__, __LINE__); exit(1); } while (false)
 
 typedef enum {
-  NORMAL,
+  UNQUOTED,
   SINGLE,
   DOUBLE,
 } quote_mode;
@@ -51,16 +51,50 @@ struct { \
 
 ARRAY(command_t) builtins = {0};
 
-char *read_quoted_arg(char *string, const char *delim, char **rest) {
+char *_read_arg(char *string, const char *delim, char **rest) {
   ARRAY(char) ret = {0};
   char *p = string;
-  quote_mode mode = NORMAL;
-  while (*p != '\0' && (mode != NORMAL || strchr(delim, *p) == NULL)) {
+  quote_mode quote = UNQUOTED;
+  while (*p != '\0' && (quote != UNQUOTED || strchr(delim, *p) == NULL)) {
     switch (*p) {
+      case '\\': {
+        switch (quote) {
+          case DOUBLE: {
+            p ++;
+            switch (*p) {
+              case '\\':
+              case '$':
+              case '"':
+              case '\n':
+                ARRAY_ADD(ret, *p);
+                break;
+
+              default:
+                ARRAY_ADD(ret, '\\');
+                ARRAY_ADD(ret, *p);
+                break;
+            }
+          }; break;
+
+          case SINGLE:
+            ARRAY_ADD(ret, *p);
+            break;
+
+          case UNQUOTED:
+            p ++;
+            ARRAY_ADD(ret, *p);
+            break;
+
+          default:
+            UNREACHABLE();
+            break;
+        }
+      }; break;
+
       case '"': {
-        switch (mode) {
-          case NORMAL:
-            mode = DOUBLE;
+        switch (quote) {
+          case UNQUOTED:
+            quote = DOUBLE;
             break;
 
           case SINGLE:
@@ -68,7 +102,7 @@ char *read_quoted_arg(char *string, const char *delim, char **rest) {
             break;
 
           case DOUBLE:
-            mode = NORMAL;
+            quote = UNQUOTED;
             break;
 
           default:
@@ -78,13 +112,13 @@ char *read_quoted_arg(char *string, const char *delim, char **rest) {
       }; break;
 
       case '\'': {
-        switch (mode) {
-          case NORMAL:
-            mode = SINGLE;
+        switch (quote) {
+          case UNQUOTED:
+            quote = SINGLE;
             break;
 
           case SINGLE:
-            mode = NORMAL;
+            quote = UNQUOTED;
             break;
 
           case DOUBLE:
@@ -97,47 +131,13 @@ char *read_quoted_arg(char *string, const char *delim, char **rest) {
         }
       }; break;
 
-      default: {
-        switch (mode) {
-          case DOUBLE:
-            switch (*p) {
-              case '\\':
-                p ++;
-                switch (*p) {
-                  case '\\':
-                  case '$':
-                  case '"':
-                  case '\n':
-                    ARRAY_ADD(ret, *p);
-                    break;
-
-                  default:
-                    ARRAY_ADD(ret, '\\');
-                    ARRAY_ADD(ret, *p);
-                    break;
-                }
-                break;
-
-              default:
-                ARRAY_ADD(ret, *p);
-                break;
-            }
-            break;
-
-          case NORMAL:
-          case SINGLE:
-            ARRAY_ADD(ret, *p);
-            break;
-
-          default:
-            UNREACHABLE();
-            break;
-        }
-      }; break;
+      default:
+        ARRAY_ADD(ret, *p);
+        break;
     }
     p ++;
   }
-  assert(mode == NORMAL);
+  assert(quote == UNQUOTED);
   *rest = p;
   ARRAY_ADD(ret, '\0');
   return ret.data;
@@ -158,7 +158,7 @@ char *read_tilde_arg(char *string, const char *delim, char **rest) {
 
   switch (*p) {
     case '/': {
-      char *arg = read_quoted_arg(p, delim, rest);
+      char *arg = _read_arg(p, delim, rest);
       char *home = getenv("HOME");
       if (home == NULL) {
         size_t arg_len = strlen(arg);
@@ -196,7 +196,7 @@ char *read_tilde_arg(char *string, const char *delim, char **rest) {
           }
 
           if (*p == '/') {
-            char *arg = read_quoted_arg(p, delim, rest);
+            char *arg = _read_arg(p, delim, rest);
             size_t dir_len = strlen(passwd->pw_dir);
             size_t arg_len = strlen(arg);
             char *full_path = malloc(dir_len + arg_len + 1);
@@ -214,7 +214,7 @@ char *read_tilde_arg(char *string, const char *delim, char **rest) {
       // Haven't found user, fall out
     }; break;
   }
-  return read_quoted_arg(string, delim, rest);
+  return _read_arg(string, delim, rest);
 }
 
 char *read_arg(char *string, const char *delim, char **rest) {
@@ -228,7 +228,7 @@ char *read_arg(char *string, const char *delim, char **rest) {
   if (*start == '~') {
     return read_tilde_arg(start, delim, rest);
   } else {
-    return read_quoted_arg(start, delim, rest);
+    return _read_arg(start, delim, rest);
   }
 }
 
