@@ -52,14 +52,8 @@ struct { \
 ARRAY(command_t) builtins = {0};
 
 char *read_quoted_arg(char *string, const char *delim, char **rest) {
-  char *start = string;
-  while (*start != '\0' && strchr(delim, *start) != NULL) start ++;
-
-  if (*start == '\0' || *start == '\n') {
-    return NULL;
-  }
   ARRAY(char) ret = {0};
-  char *p = start;
+  char *p = string;
   quote_mode mode = NORMAL;
   while (*p != '\0' && (mode != NORMAL || strchr(delim, *p) == NULL)) {
     switch (*p) {
@@ -88,7 +82,25 @@ char *read_quoted_arg(char *string, const char *delim, char **rest) {
       }; break;
 
       default: {
-        ARRAY_ADD(ret, *p);
+        switch (mode) {
+          case DOUBLE:
+            switch (*p) {
+
+              default:
+                ARRAY_ADD(ret, *p);
+                break;
+            }
+            break;
+
+          case NORMAL:
+          case SINGLE:
+            ARRAY_ADD(ret, *p);
+            break;
+
+          default:
+            UNREACHABLE();
+            break;
+        }
       }; break;
     }
     p ++;
@@ -174,10 +186,17 @@ char *read_tilde_arg(char *string, const char *delim, char **rest) {
 }
 
 char *read_arg(char *string, const char *delim, char **rest) {
-  if (*string == '~') {
-    return read_tilde_arg(string, delim, rest);
+  char *start = string;
+  while (*start != '\0' && strchr(delim, *start) != NULL) start ++;
+
+  if (*start == '\0' || *start == '\n') {
+    return NULL;
+  }
+
+  if (*start == '~') {
+    return read_tilde_arg(start, delim, rest);
   } else {
-    return read_quoted_arg(string, delim, rest);
+    return read_quoted_arg(start, delim, rest);
   }
 }
 
