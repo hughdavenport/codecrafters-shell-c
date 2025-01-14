@@ -58,7 +58,23 @@ char *read_quoted_arg(char *string, const char *delim, char **rest) {
   while (*p != '\0' && (mode != NORMAL || strchr(delim, *p) == NULL)) {
     switch (*p) {
       case '"': {
-        UNIMPLENTED("Double quoted arguments");
+        switch (mode) {
+          case NORMAL:
+            mode = DOUBLE;
+            break;
+
+          case SINGLE:
+            ARRAY_ADD(ret, '"');
+            break;
+
+          case DOUBLE:
+            mode = NORMAL;
+            break;
+
+          default:
+            UNREACHABLE();
+            break;
+        }
       }; break;
 
       case '\'': {
@@ -85,6 +101,22 @@ char *read_quoted_arg(char *string, const char *delim, char **rest) {
         switch (mode) {
           case DOUBLE:
             switch (*p) {
+              case '\\':
+                p ++;
+                switch (*p) {
+                  case '\\':
+                  case '$':
+                  case '"':
+                  case '\n':
+                    ARRAY_ADD(ret, *p);
+                    break;
+
+                  default:
+                    ARRAY_ADD(ret, '\\');
+                    ARRAY_ADD(ret, *p);
+                    break;
+                }
+                break;
 
               default:
                 ARRAY_ADD(ret, *p);
