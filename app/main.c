@@ -79,12 +79,12 @@ void close_open_files() {
   }
 }
 
-char *_read_arg(char *string, const char *delim, char **rest, bool *quoted) {
+char *_read_arg(char *string, const char *delim, char **rest, bool *quoted, quote_mode *quote, bool *cont) {
+  *cont = false;
   ARRAY(char) ret = {0};
   char *p = string;
-  quote_mode quote = UNQUOTED;
-  while (*p != '\0' && (quote != UNQUOTED || strchr(delim, *p) == NULL)) {
-    if (quote == UNQUOTED && *p == '>') {
+  while (*p != '\0' && (*quote != UNQUOTED || strchr(delim, *p) == NULL)) {
+    if (*quote == UNQUOTED && *p == '>') {
       if (p == string) {
         ARRAY_ADD(ret, '>');
         p ++;
@@ -100,7 +100,7 @@ char *_read_arg(char *string, const char *delim, char **rest, bool *quoted) {
 
     switch (*p) {
       case '\\': {
-        switch (quote) {
+        switch (*quote) {
           case DOUBLE: {
             p ++;
             switch (*p) {
@@ -124,7 +124,16 @@ char *_read_arg(char *string, const char *delim, char **rest, bool *quoted) {
 
           case UNQUOTED:
             p ++;
-            ARRAY_ADD(ret, *p);
+            switch (*p) {
+              case '\n':
+                assert(*(p + 1) == '\0');
+                *cont = true;
+                break;
+
+              default:
+                ARRAY_ADD(ret, *p);
+                break;
+            }
             break;
 
           default:
@@ -134,9 +143,9 @@ char *_read_arg(char *string, const char *delim, char **rest, bool *quoted) {
       }; break;
 
       case '"': {
-        switch (quote) {
+        switch (*quote) {
           case UNQUOTED:
-            quote = DOUBLE;
+            *quote = DOUBLE;
             *quoted = true;
             break;
 
@@ -145,7 +154,7 @@ char *_read_arg(char *string, const char *delim, char **rest, bool *quoted) {
             break;
 
           case DOUBLE:
-            quote = UNQUOTED;
+            *quote = UNQUOTED;
             break;
 
           default:
@@ -155,14 +164,14 @@ char *_read_arg(char *string, const char *delim, char **rest, bool *quoted) {
       }; break;
 
       case '\'': {
-        switch (quote) {
+        switch (*quote) {
           case UNQUOTED:
-            quote = SINGLE;
+            *quote = SINGLE;
             *quoted = true;
             break;
 
           case SINGLE:
-            quote = UNQUOTED;
+            *quote = UNQUOTED;
             break;
 
           case DOUBLE:
@@ -181,13 +190,17 @@ char *_read_arg(char *string, const char *delim, char **rest, bool *quoted) {
     }
     p ++;
   }
-  assert(quote == UNQUOTED);
+  if (*quote != UNQUOTED) {
+    assert(*p == '\0');
+    *cont = true;
+  }
   *rest = p;
   ARRAY_ADD(ret, '\0');
   return ret.data;
 }
 
-char *read_tilde_arg(char *string, const char *delim, char **rest, bool *quoted) {
+char *_read_tilde_arg(char *string, const char *delim, char **rest, bool *quoted, quote_mode *quote, bool *cont) {
+  assert(*quote == UNQUOTED);
   char *p = string + 1;
   struct passwd *passwd = NULL;
 
@@ -202,7 +215,7 @@ char *read_tilde_arg(char *string, const char *delim, char **rest, bool *quoted)
 
   switch (*p) {
     case '/': {
-      char *arg = _read_arg(p, delim, rest, quoted);
+      char *arg = _read_arg(p, delim, rest, quoted, quote, cont);
       char *home = getenv("HOME");
       if (home == NULL) {
         size_t arg_len = strlen(arg);
@@ -240,7 +253,7 @@ char *read_tilde_arg(char *string, const char *delim, char **rest, bool *quoted)
           }
 
           if (*p == '/') {
-            char *arg = _read_arg(p, delim, rest, quoted);
+            char *arg = _read_arg(p, delim, rest, quoted, quote, cont);
             size_t dir_len = strlen(passwd->pw_dir);
             size_t arg_len = strlen(arg);
             char *full_path = malloc(dir_len + arg_len + 1);
@@ -258,10 +271,12 @@ char *read_tilde_arg(char *string, const char *delim, char **rest, bool *quoted)
       // Haven't found user, fall out
     }; break;
   }
-  return _read_arg(string, delim, rest, quoted);
+  return _read_arg(string, delim, rest, quoted, quote, cont);
 }
 
-char *read_arg(char *string, const char *delim, char **rest, bool *quoted) {
+char *read_arg(char *string, const char *delim, char **rest, bool *quoted, quote_mode *quote, bool *cont) {
+  assert(*quote == UNQUOTED);
+  assert(!*cont);
   *quoted = false;
   char *start = string;
   while (*start != '\0' && strchr(delim, *start) != NULL) start ++;
@@ -271,10 +286,43 @@ char *read_arg(char *string, const char *delim, char **rest, bool *quoted) {
   }
 
   if (*start == '~') {
-    return read_tilde_arg(start, delim, rest, quoted);
+    return _read_tilde_arg(start, delim, rest, quoted, quote, cont);
   } else {
-    return _read_arg(start, delim, rest, quoted);
+    return _read_arg(start, delim, rest, quoted, quote, cont);
   }
+}
+
+char *continue_arg(char *existing, char *string, const char *delim, char **rest, bool *quoted, quote_mode *quote, bool *cont) {
+  assert(existing != NULL);
+  assert(*cont);
+
+  char *start = string;
+  if (*quote == UNQUOTED) while (*start != '\0' && strchr(delim, *start) != NULL) start ++;
+
+  if (*start == '\0' || *start == '\n') {
+    if (*quote == UNQUOTED) return existing;
+    size_t existing_len = strlen(existing);
+    size_t arg_len = strlen(start);
+    assert(arg_len <= 1); // string expected to be a single line from fgets
+    char *ret = malloc(existing_len + arg_len + 1);
+    strcpy(ret, existing);
+    strcpy(ret + existing_len, start);
+    ret[existing_len + arg_len] = '\0';
+    free(existing);
+    return ret;
+  }
+
+  char *arg = _read_arg(start, delim, rest, quoted, quote, cont);
+  if (arg == NULL) return existing;
+  size_t existing_len = strlen(existing);
+  size_t arg_len = strlen(arg);
+  char *ret = malloc(existing_len + arg_len + 1);
+  strcpy(ret, existing);
+  strcpy(ret + existing_len, arg);
+  ret[existing_len + arg_len] = '\0';
+  free(existing);
+  free(arg);
+  return ret;
 }
 
 extern char **environ;
@@ -520,6 +568,7 @@ int main(int argc, char **argv) {
   setbuf(stdout, NULL);
 
   while (feof(stdin) == 0) {
+    // FIXME read PS1
     printf("$ ");
 
     // Wait for user input
@@ -529,12 +578,45 @@ int main(int argc, char **argv) {
     char *delim = " \n";
     string_array args = {0};
     bool error = false;
+    quote_mode quote = UNQUOTED;
     char *rest = input;
     char *arg;
     bool quoted;
-    while ((arg = read_arg(rest, delim, &rest, &quoted)) != NULL) {
-      if (!quoted && (strcmp(arg, ">") == 0 || strcmp(arg, ">>") == 0)) {
+    bool get_new_line = false;
+    while ((arg = read_arg(rest, delim, &rest, &quoted, &quote, &get_new_line)) != NULL) {
+      while (get_new_line) {
+        assert(rest == NULL || *rest == '\0');
+        // FIXME read PS2
+        printf("> ");
 
+        // Wait for user input
+        if (fgets(input, 100, stdin) == NULL) {
+          switch (quote) {
+            case SINGLE:
+              fprintf(stderr, "syntax error: Unexpected EOF while looking for matching single quote << ' >>\n");
+              error = true;
+              break;
+
+            case DOUBLE:
+              fprintf(stderr, "syntax error: Unexpected EOF while looking for matching double quote << \" >>\n");
+              error = true;
+              break;
+
+            case UNQUOTED:
+              break;
+
+            default:
+              UNREACHABLE();
+              break;
+          }
+          break;
+        } else {
+          arg = continue_arg(arg, input, delim, &rest, &quoted, &quote, &get_new_line);
+          assert(arg != NULL);
+        }
+      }
+      if (error) goto cont;
+      if (!quoted && (strcmp(arg, ">") == 0 || strcmp(arg, ">>") == 0)) {
         long fd = STDOUT_FILENO;
         if (args.size > 0) {
           char *end;
@@ -554,12 +636,28 @@ int main(int argc, char **argv) {
           break;
         }
 
-        arg = read_arg(rest, delim, &rest, &quoted);
+        arg = read_arg(rest, delim, &rest, &quoted, &quote, &get_new_line);
         if (arg == NULL) {
           fprintf(stderr, "syntax error, missing filename of redirect\n");
           error = true;
           break;
         }
+        while (get_new_line) {
+          assert(rest == NULL || *rest == '\0');
+          // FIXME read PS2
+          printf("> ");
+
+          // Wait for user input
+          if (fgets(input, 100, stdin) == NULL) {
+            fprintf(stderr, "syntax error, missing filename of redirect\n");
+            error = true;
+            break;
+          }
+
+          arg = continue_arg(arg, input, delim, &rest, &quoted, &quote, &get_new_line);
+          assert(arg != NULL);
+        }
+        if (error) goto cont;
 
         ARRAY_ENSURE_CAPACITY(files, fd + 1);
         if (fd >= files.size) files.size = fd + 1;
