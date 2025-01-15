@@ -1,4 +1,6 @@
 #include <assert.h>
+#include <poll.h>
+#include <termios.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -12,7 +14,10 @@
 #include <sys/wait.h>
 
 #define UNIMPLENTED(msg) do { fprintf(stderr, "%s:%d: UNIMPLENTED: %s", __FILE__, __LINE__, msg); exit(1); } while (false)
-#define UNREACHABLE(msg) do { fprintf(stderr, "%s:%d: UNREACHABLE", __FILE__, __LINE__); exit(1); } while (false)
+#define UNREACHABLE() do { fprintf(stderr, "%s:%d: UNREACHABLE", __FILE__, __LINE__); exit(1); } while (false)
+
+#define CTRL_C 003
+#define CTRL_D 004
 
 typedef enum {
   UNQUOTED,
@@ -79,59 +84,143 @@ void close_open_files() {
   }
 }
 
-char *_read_arg(char *string, const char *delim, char **rest, bool *quoted, quote_mode *quote, bool *cont) {
-  *cont = false;
+typedef struct {
+  char buffer[4097];
+  size_t capacity;
+  size_t offset;
+  int fd;
+  bool eof;
+} read_buffer;
+read_buffer stdin_buf = {
+  .fd = STDIN_FILENO,
+};
+
+#define WAIT_FOR_INPUT(buf) do { \
+  assert((buf).offset >= (buf).capacity); \
+  struct pollfd fd = { \
+      .fd = (buf).fd, \
+      .events = POLLIN, \
+  }; \
+  if (poll(&fd, 1, -1) < 0) { \
+    (buf).eof = true; \
+  } else { \
+    assert(fd.revents != 0 && (fd.revents & POLLIN) != 0); \
+  } \
+} while (false)
+
+#define ENSURE_INPUT(buf) do { \
+  if ((buf).offset >= (buf).capacity) { \
+    WAIT_FOR_INPUT((buf)); \
+    if ((buf).eof) break; \
+    ssize_t n = read((buf).fd, (buf).buffer, sizeof((buf).buffer) - 1); \
+    assert(n >= 0); \
+    (buf).offset = 0; \
+    (buf).capacity = n; \
+    if (n == 0) (buf).eof = true; \
+  } \
+} while (false)
+
+char peek_char(read_buffer *buf) {
+  ENSURE_INPUT(*buf);
+  return buf->eof ? EOF : buf->buffer[buf->offset];
+}
+
+char read_char(read_buffer *buf) {
+  ENSURE_INPUT(*buf);
+  return buf->eof ? EOF : buf->buffer[buf->offset++];
+}
+
+bool is_eof(read_buffer *buf) {
+  /* ENSURE_INPUT(*buf); */
+  return buf->eof;
+}
+
+char *_read_arg(const char *delim, bool *quoted, quote_mode *quote, bool *error) {
   ARRAY(char) ret = {0};
-  char *p = string;
-  while (*p != '\0' && (*quote != UNQUOTED || strchr(delim, *p) == NULL)) {
-    if (*quote == UNQUOTED && *p == '>') {
-      if (p == string) {
-        ARRAY_ADD(ret, '>');
-        p ++;
-        if (*p == '>') {
-          ARRAY_ADD(ret, '>');
-          p ++;
-        }
+  while (peek_char(&stdin_buf) != EOF && (*quote != UNQUOTED || strchr(delim, peek_char(&stdin_buf)) == NULL)) {
+    if (*quote == UNQUOTED) {
+      if ((ret.size >= 1 && strncmp(ret.data, ">", 1) == 0) || (ret.size >= 2 && strncmp(ret.data, ">>", 2) == 0)) {
+        ARRAY_ADD(ret, '\0');
+        return ret.data;
+      } else if (ret.size > 0 && peek_char(&stdin_buf) == '>') {
+        break;
       }
-      *rest = p;
-      ARRAY_ADD(ret, '\0');
-      return ret.data;
     }
 
-    switch (*p) {
+    switch (peek_char(&stdin_buf)) {
+      case EOF:
+        *error = true;
+        break;
+
+      case CTRL_C: {
+        ARRAY_FREE(ret);
+        *error = true;
+        return NULL;
+      }; break;
+
+      case CTRL_D: {
+        UNIMPLENTED("EOF mid arg");
+      }; break;
+
       case '\\': {
         switch (*quote) {
           case DOUBLE: {
-            p ++;
-            switch (*p) {
+            read_char(&stdin_buf);
+            switch (peek_char(&stdin_buf)) {
+              case EOF:
+                break;
+
+              case CTRL_C: {
+                UNIMPLENTED("CTRL-C mid arg");
+              }; break;
+
+              case CTRL_D: {
+                UNIMPLENTED("EOF mid arg");
+              }; break;
+
+              case '\n':
+                // FIXME read PS2
+                printf("> ");
+                // fallthrough
               case '\\':
               case '$':
               case '"':
-              case '\n':
-                ARRAY_ADD(ret, *p);
+              case '>':
+                ARRAY_ADD(ret, peek_char(&stdin_buf));
                 break;
 
               default:
                 ARRAY_ADD(ret, '\\');
-                ARRAY_ADD(ret, *p);
+                ARRAY_ADD(ret, peek_char(&stdin_buf));
                 break;
             }
           }; break;
 
           case SINGLE:
-            ARRAY_ADD(ret, *p);
+            ARRAY_ADD(ret, peek_char(&stdin_buf));
             break;
 
           case UNQUOTED:
-            p ++;
-            switch (*p) {
+            read_char(&stdin_buf);
+            switch (peek_char(&stdin_buf)) {
+              case EOF:
+                break;
+
+              case CTRL_C: {
+                UNIMPLENTED("CTRL-C mid arg");
+              }; break;
+
+              case CTRL_D: {
+                UNIMPLENTED("EOF mid arg");
+              }; break;
+
               case '\n':
-                assert(*(p + 1) == '\0');
-                *cont = true;
+                // FIXME read PS2
+                printf("> ");
                 break;
 
               default:
-                ARRAY_ADD(ret, *p);
+                ARRAY_ADD(ret, peek_char(&stdin_buf));
                 break;
             }
             break;
@@ -184,28 +273,49 @@ char *_read_arg(char *string, const char *delim, char **rest, bool *quoted, quot
         }
       }; break;
 
+      case '\n':
+        // FIXME read PS2
+        printf("> ");
       default:
-        ARRAY_ADD(ret, *p);
+        ARRAY_ADD(ret, peek_char(&stdin_buf));
         break;
     }
-    p ++;
+    if (!*error) read_char(&stdin_buf);
   }
-  if (*quote != UNQUOTED) {
-    assert(*p == '\0');
-    *cont = true;
+  if (is_eof(&stdin_buf)) {
+    ARRAY_FREE(ret);
+    switch (*quote) {
+      case SINGLE:
+        fprintf(stderr, "syntax error: Unexpected EOF while looking for matching single quote << ' >>\n");
+        *error = true;
+        break;
+
+      case DOUBLE:
+        fprintf(stderr, "syntax error: Unexpected EOF while looking for matching double quote << \" >>\n");
+        *error = true;
+        break;
+
+      case UNQUOTED:
+        break;
+
+      default:
+        UNREACHABLE();
+        break;
+    }
+    return NULL;
   }
-  *rest = p;
+  assert(*quote == UNQUOTED);
   ARRAY_ADD(ret, '\0');
   return ret.data;
 }
 
-char *_read_tilde_arg(char *string, const char *delim, char **rest, bool *quoted, quote_mode *quote, bool *cont) {
+char *_read_tilde_arg(const char *delim, bool *quoted, quote_mode *quote, bool *error) {
   assert(*quote == UNQUOTED);
-  char *p = string + 1;
+  assert(!is_eof(&stdin_buf));
+  assert(read_char(&stdin_buf) == '~');
   struct passwd *passwd = NULL;
 
-  if (*p == '\0' || strchr(delim, *p) != NULL) {
-    *rest = p;
+  if (peek_char(&stdin_buf) == '\0' || strchr(delim, peek_char(&stdin_buf)) != NULL) {
     char *home = getenv("HOME");
     if (home == NULL) {
       return strdup("~");
@@ -213,9 +323,21 @@ char *_read_tilde_arg(char *string, const char *delim, char **rest, bool *quoted
     return strdup(home);
   }
 
-  switch (*p) {
+  switch (peek_char(&stdin_buf)) {
+    case EOF:
+      *error = true;
+      break;
+
+    case CTRL_C: {
+      UNIMPLENTED("Ctrl-C mid arg");
+    }; break;
+
+    case CTRL_D: {
+      UNIMPLENTED("EOF mid arg");
+    }; break;
+
     case '/': {
-      char *arg = _read_arg(p, delim, rest, quoted, quote, cont);
+      char *arg = _read_arg(delim, quoted, quote, error);
       char *home = getenv("HOME");
       if (home == NULL) {
         size_t arg_len = strlen(arg);
@@ -239,21 +361,25 @@ char *_read_tilde_arg(char *string, const char *delim, char **rest, bool *quoted
 
     default: {
       // ~user
+      ARRAY(char) username = {0};
+      read_char(&stdin_buf);
+      while (peek_char(&stdin_buf) != '\0' &&
+          peek_char(&stdin_buf) != '/' &&
+          strchr(delim, peek_char(&stdin_buf)) == NULL) {
+        ARRAY_ADD(username, read_char(&stdin_buf));
+      }
       while ((passwd = getpwent()) != NULL) {
         size_t len = strlen(passwd->pw_name);
-        if (strncmp(p, passwd->pw_name, len) == 0) {
+        if (len == username.size && strncmp(username.data, passwd->pw_name, len) == 0) {
           setpwent();
           endpwent();
-          p += len;
 
-
-          if (*p == '\0' || strchr(delim, *p) != NULL) {
-            *rest = p;
+          if (peek_char(&stdin_buf) == '\0' || strchr(delim, peek_char(&stdin_buf)) != NULL) {
             return strdup(passwd->pw_dir);
           }
 
-          if (*p == '/') {
-            char *arg = _read_arg(p, delim, rest, quoted, quote, cont);
+          if (peek_char(&stdin_buf) == '/') {
+            char *arg = _read_arg(delim, quoted, quote, error);
             size_t dir_len = strlen(passwd->pw_dir);
             size_t arg_len = strlen(arg);
             char *full_path = malloc(dir_len + arg_len + 1);
@@ -269,60 +395,53 @@ char *_read_tilde_arg(char *string, const char *delim, char **rest, bool *quoted
       setpwent();
       endpwent();
       // Haven't found user, fall out
+      char *arg = _read_arg(delim, quoted, quote, error);
+      size_t arg_len = strlen(arg);
+      char *ret = malloc(username.size + arg_len + 2);
+      assert(ret != NULL);
+      ret[0] = '~';
+      strncpy(ret + 1, username.data, username.size);
+      strcpy(ret + username.size + 1, arg);
+      ret[username.size + arg_len + 1] = '\0';
+      free(arg);
+      ARRAY_FREE(username);
+      return ret;
     }; break;
   }
-  return _read_arg(string, delim, rest, quoted, quote, cont);
+  return _read_arg(delim, quoted, quote, error);
 }
 
-char *read_arg(char *string, const char *delim, char **rest, bool *quoted, quote_mode *quote, bool *cont) {
+char *read_arg(const char *delim, bool *quoted, quote_mode *quote, bool *error) {
   assert(*quote == UNQUOTED);
-  assert(!*cont);
   *quoted = false;
-  char *start = string;
-  while (*start != '\0' && strchr(delim, *start) != NULL) start ++;
 
-  if (*start == '\0' || *start == '\n') {
-    return NULL;
+  while (peek_char(&stdin_buf) != EOF &&
+      peek_char(&stdin_buf) != '\n' &&
+      strchr(delim, peek_char(&stdin_buf)) != NULL) {
+    read_char(&stdin_buf);
   }
 
-  if (*start == '~') {
-    return _read_tilde_arg(start, delim, rest, quoted, quote, cont);
-  } else {
-    return _read_arg(start, delim, rest, quoted, quote, cont);
+  switch (peek_char(&stdin_buf)) {
+    case CTRL_C: {
+      UNIMPLENTED("Ctrl-C start arg");
+    }; break;
+
+    case CTRL_D: {
+      UNIMPLENTED("EOF start arg");
+    }; break;
+
+    case '~':
+      return _read_tilde_arg(delim, quoted, quote, error);
+
+    case '\n':
+      read_char(&stdin_buf);
+      // fall through
+    case EOF:
+      return NULL;
+
+    default:
+      return _read_arg(delim, quoted, quote, error);
   }
-}
-
-char *continue_arg(char *existing, char *string, const char *delim, char **rest, bool *quoted, quote_mode *quote, bool *cont) {
-  assert(existing != NULL);
-  assert(*cont);
-
-  char *start = string;
-  if (*quote == UNQUOTED) while (*start != '\0' && strchr(delim, *start) != NULL) start ++;
-
-  if (*start == '\0' || *start == '\n') {
-    if (*quote == UNQUOTED) return existing;
-    size_t existing_len = strlen(existing);
-    size_t arg_len = strlen(start);
-    assert(arg_len <= 1); // string expected to be a single line from fgets
-    char *ret = malloc(existing_len + arg_len + 1);
-    strcpy(ret, existing);
-    strcpy(ret + existing_len, start);
-    ret[existing_len + arg_len] = '\0';
-    free(existing);
-    return ret;
-  }
-
-  char *arg = _read_arg(start, delim, rest, quoted, quote, cont);
-  if (arg == NULL) return existing;
-  size_t existing_len = strlen(existing);
-  size_t arg_len = strlen(arg);
-  char *ret = malloc(existing_len + arg_len + 1);
-  strcpy(ret, existing);
-  strcpy(ret + existing_len, arg);
-  ret[existing_len + arg_len] = '\0';
-  free(existing);
-  free(arg);
-  return ret;
 }
 
 extern char **environ;
@@ -340,6 +459,7 @@ int run_program(char *file_path, string_array args) {
       return -1;
 
     case 0:
+      // FIXME get stdin working, pipe maybe
       for (size_t i = 0; i < files.size; i ++) {
         if (files.data[i] != NULL) {
           int fd = fileno(files.data[i]);
@@ -557,6 +677,15 @@ int cd_command(string_array args) {
 }
 
 int main(int argc, char **argv) {
+  struct termios old_termios;
+  if (tcgetattr(STDIN_FILENO, &old_termios) == 0) {
+    struct termios term = old_termios;
+    term = old_termios;
+    term.c_lflag &= ~(ICANON|ISIG);
+    term.c_cc[VTIME] = 0;
+    term.c_cc[VMIN] = 0;
+    assert(tcsetattr(STDIN_FILENO, TCSANOW, &term) == 0);
+  }
   ARRAY_ADD(builtins, COMMAND(help, "Displays help about commands."));
   ARRAY_ADD(builtins, COMMAND(exit, "Exit the shell, with optional code."));
   ARRAY_ADD(builtins, COMMAND(echo, "Prints any arguments to stdout."));
@@ -567,55 +696,17 @@ int main(int argc, char **argv) {
   // Flush after every printf
   setbuf(stdout, NULL);
 
-  while (feof(stdin) == 0) {
+  while (is_eof(&stdin_buf) == 0) {
     // FIXME read PS1
     printf("$ ");
-
-    // Wait for user input
-    char input[100];
-    if (fgets(input, 100, stdin) == NULL) break;
 
     char *delim = " \n";
     string_array args = {0};
     bool error = false;
     quote_mode quote = UNQUOTED;
-    char *rest = input;
     char *arg;
     bool quoted;
-    bool get_new_line = false;
-    while ((arg = read_arg(rest, delim, &rest, &quoted, &quote, &get_new_line)) != NULL) {
-      while (get_new_line) {
-        assert(rest == NULL || *rest == '\0');
-        // FIXME read PS2
-        printf("> ");
-
-        // Wait for user input
-        if (fgets(input, 100, stdin) == NULL) {
-          switch (quote) {
-            case SINGLE:
-              fprintf(stderr, "syntax error: Unexpected EOF while looking for matching single quote << ' >>\n");
-              error = true;
-              break;
-
-            case DOUBLE:
-              fprintf(stderr, "syntax error: Unexpected EOF while looking for matching double quote << \" >>\n");
-              error = true;
-              break;
-
-            case UNQUOTED:
-              break;
-
-            default:
-              UNREACHABLE();
-              break;
-          }
-          break;
-        } else {
-          arg = continue_arg(arg, input, delim, &rest, &quoted, &quote, &get_new_line);
-          assert(arg != NULL);
-        }
-      }
-      if (error) goto cont;
+    while ((arg = read_arg(delim, &quoted, &quote, &error)) != NULL) {
       if (!quoted && (strcmp(arg, ">") == 0 || strcmp(arg, ">>") == 0)) {
         long fd = STDOUT_FILENO;
         if (args.size > 0) {
@@ -636,26 +727,11 @@ int main(int argc, char **argv) {
           break;
         }
 
-        arg = read_arg(rest, delim, &rest, &quoted, &quote, &get_new_line);
-        if (arg == NULL) {
+        arg = read_arg(delim, &quoted, &quote, &error);
+        if (error || arg == NULL) {
           fprintf(stderr, "syntax error, missing filename of redirect\n");
           error = true;
           break;
-        }
-        while (get_new_line) {
-          assert(rest == NULL || *rest == '\0');
-          // FIXME read PS2
-          printf("> ");
-
-          // Wait for user input
-          if (fgets(input, 100, stdin) == NULL) {
-            fprintf(stderr, "syntax error, missing filename of redirect\n");
-            error = true;
-            break;
-          }
-
-          arg = continue_arg(arg, input, delim, &rest, &quoted, &quote, &get_new_line);
-          assert(arg != NULL);
         }
         if (error) goto cont;
 
@@ -736,5 +812,6 @@ cont:
   close_open_files();
   ARRAY_FREE(files);
   ARRAY_FREE(builtins);
+  tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
   return 0;
 }
