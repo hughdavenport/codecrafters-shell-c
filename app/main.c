@@ -707,6 +707,7 @@ int main(int argc, char **argv) {
     char *arg;
     bool quoted;
     while ((arg = read_arg(delim, &quoted, &quote, &error)) != NULL) {
+        fprintf(stderr, "Got arg |%s|, quoted = %d, mode = %d, error = %d\n", arg, quoted, quote, error);
       if (!quoted && (strcmp(arg, ">") == 0 || strcmp(arg, ">>") == 0)) {
         long fd = STDOUT_FILENO;
         if (args.size > 0) {
