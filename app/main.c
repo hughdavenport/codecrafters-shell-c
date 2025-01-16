@@ -135,17 +135,20 @@ bool is_eof(read_buffer *buf) {
   return buf->eof;
 }
 
-char *_read_arg(const char *delim, bool *quoted, quote_mode *quote, bool *error) {
+char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error) {
   ARRAY(char) ret = {0};
+  *escaped = false;
   while (peek_char(&stdin_buf) != EOF && (*quote != UNQUOTED || strchr(delim, peek_char(&stdin_buf)) == NULL)) {
-    if (*quote == UNQUOTED) {
-      if ((ret.size >= 1 && strncmp(ret.data, ">", 1) == 0) || (ret.size >= 2 && strncmp(ret.data, ">>", 2) == 0)) {
+    if (!*escaped && *quote == UNQUOTED) {
+      if (ret.size == 1 && ret.data[0] == '>') {
+        if (peek_char(&stdin_buf) == '>') ARRAY_ADD(ret, read_char(&stdin_buf));
         ARRAY_ADD(ret, '\0');
         return ret.data;
       } else if (ret.size > 0 && peek_char(&stdin_buf) == '>') {
         break;
       }
     }
+    *escaped = false;
 
     switch (peek_char(&stdin_buf)) {
       case EOF:
@@ -186,10 +189,12 @@ char *_read_arg(const char *delim, bool *quoted, quote_mode *quote, bool *error)
               case '$':
               case '"':
               case '>':
+                *escaped = true;
                 ARRAY_ADD(ret, peek_char(&stdin_buf));
                 break;
 
               default:
+                *escaped = true;
                 ARRAY_ADD(ret, '\\');
                 ARRAY_ADD(ret, peek_char(&stdin_buf));
                 break;
@@ -309,7 +314,7 @@ char *_read_arg(const char *delim, bool *quoted, quote_mode *quote, bool *error)
   return ret.data;
 }
 
-char *_read_tilde_arg(const char *delim, bool *quoted, quote_mode *quote, bool *error) {
+char *_read_tilde_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error) {
   assert(*quote == UNQUOTED);
   assert(!is_eof(&stdin_buf));
   assert(read_char(&stdin_buf) == '~');
@@ -337,7 +342,7 @@ char *_read_tilde_arg(const char *delim, bool *quoted, quote_mode *quote, bool *
     }; break;
 
     case '/': {
-      char *arg = _read_arg(delim, quoted, quote, error);
+      char *arg = _read_arg(delim, quoted, escaped, quote, error);
       char *home = getenv("HOME");
       if (home == NULL) {
         size_t arg_len = strlen(arg);
@@ -379,7 +384,7 @@ char *_read_tilde_arg(const char *delim, bool *quoted, quote_mode *quote, bool *
           }
 
           if (peek_char(&stdin_buf) == '/') {
-            char *arg = _read_arg(delim, quoted, quote, error);
+            char *arg = _read_arg(delim, quoted, escaped, quote, error);
             size_t dir_len = strlen(passwd->pw_dir);
             size_t arg_len = strlen(arg);
             char *full_path = malloc(dir_len + arg_len + 1);
@@ -395,7 +400,7 @@ char *_read_tilde_arg(const char *delim, bool *quoted, quote_mode *quote, bool *
       setpwent();
       endpwent();
       // Haven't found user, fall out
-      char *arg = _read_arg(delim, quoted, quote, error);
+      char *arg = _read_arg(delim, quoted, escaped, quote, error);
       size_t arg_len = strlen(arg);
       char *ret = malloc(username.size + arg_len + 2);
       assert(ret != NULL);
@@ -408,10 +413,10 @@ char *_read_tilde_arg(const char *delim, bool *quoted, quote_mode *quote, bool *
       return ret;
     }; break;
   }
-  return _read_arg(delim, quoted, quote, error);
+  return _read_arg(delim, quoted, escaped, quote, error);
 }
 
-char *read_arg(const char *delim, bool *quoted, quote_mode *quote, bool *error) {
+char *read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error) {
   assert(*quote == UNQUOTED);
   *quoted = false;
 
@@ -431,7 +436,7 @@ char *read_arg(const char *delim, bool *quoted, quote_mode *quote, bool *error) 
     }; break;
 
     case '~':
-      return _read_tilde_arg(delim, quoted, quote, error);
+      return _read_tilde_arg(delim, quoted, escaped, quote, error);
 
     case '\n':
       read_char(&stdin_buf);
@@ -440,7 +445,7 @@ char *read_arg(const char *delim, bool *quoted, quote_mode *quote, bool *error) 
       return NULL;
 
     default:
-      return _read_arg(delim, quoted, quote, error);
+      return _read_arg(delim, quoted, escaped, quote, error);
   }
 }
 
@@ -451,6 +456,12 @@ int run_program(char *file_path, string_array args) {
     ARRAY_ADD(argv, args.data[i]);
   }
   ARRAY_ADD(argv, NULL);
+  int stdin_pipe[2];
+  int stdout_pipe[2];
+  int stderr_pipe[2];
+  assert(pipe(stdin_pipe) == 0);
+  assert(pipe(stdout_pipe) == 0);
+  assert(pipe(stderr_pipe) == 0);
   pid_t pid = fork();
   switch (pid) {
     case -1:
@@ -460,9 +471,16 @@ int run_program(char *file_path, string_array args) {
 
     case 0:
       // FIXME get stdin working, pipe maybe
+      assert(close(stdin_pipe[1]) != -1);
+      assert(close(stdout_pipe[0]) != -1);
+      assert(close(stderr_pipe[0]) != -1);
+      assert(dup2(stdin_pipe[0], STDIN_FILENO) != -1);
+      assert(dup2(stdout_pipe[1], STDOUT_FILENO) != -1);
+      assert(dup2(stderr_pipe[1], STDERR_FILENO) != -1);
       for (size_t i = 0; i < files.size; i ++) {
         if (files.data[i] != NULL) {
           int fd = fileno(files.data[i]);
+          close(i);
           assert(dup2(fd, i) == i);
         }
       }
@@ -471,9 +489,54 @@ int run_program(char *file_path, string_array args) {
       return -1;
 
     default: {
-      int wstatus = 0;
-      assert(waitpid(pid, &wstatus, 0) != -1);
       ARRAY_FREE(argv);
+      assert(close(stdin_pipe[0]) != -1);
+      assert(close(stdout_pipe[1]) != -1);
+      assert(close(stderr_pipe[1]) != -1);
+      int wstatus = 0;
+      while (true) {
+        pid_t wait_ret = waitpid(pid, &wstatus, WNOHANG);
+        assert(wait_ret != -1);
+        if (wait_ret != 0) fprintf(stderr, "wait returned %d, wstatus = %d\n", wait_ret, wstatus);
+        if (wait_ret != 0 && WIFEXITED(wstatus)) break;
+
+        // FIXME do a poll on all of these buffers
+        read_buffer stdout_buf = {
+          .fd = stdout_pipe[0],
+        };
+        read_buffer stderr_buf = {
+          .fd = stderr_pipe[0],
+        };
+
+        ENSURE_INPUT(stdin_buf);
+        size_t to_write = stdin_buf.capacity - stdin_buf.offset;
+        for (size_t i = 0; i < to_write; i ++) {
+          switch (stdin_buf.buffer[stdin_buf.offset + i]) {
+            case CTRL_C:
+              fprintf(stderr, "Ctrl-C in run_program\n");
+              break;
+
+            case CTRL_D:
+              fprintf(stderr, "Ctrl-D in run_program\n");
+              break;
+
+            default:
+              fprintf(stderr, "Sending '%c'\n", stdin_buf.buffer[stdin_buf.offset + i]);
+          }
+        }
+        while (to_write > 0) {
+          ssize_t ret = write(stdin_pipe[1], stdin_buf.buffer + stdin_buf.offset, to_write);
+          assert(ret >= 0);
+          assert(ret > 0);
+          stdin_buf.offset += ret;
+          to_write -= ret;
+        }
+        ENSURE_INPUT(stdout_buf);
+        for (size_t i = stdout_buf.offset; i < stdout_buf.capacity; i ++) {
+          printf("%c", stdout_buf.buffer[stdout_buf.offset++]);
+        }
+      }
+      assert(waitpid(pid, &wstatus, 0) != -1);
       return WEXITSTATUS(wstatus);
     }
   }
@@ -706,9 +769,9 @@ int main(int argc, char **argv) {
     quote_mode quote = UNQUOTED;
     char *arg;
     bool quoted;
-    while ((arg = read_arg(delim, &quoted, &quote, &error)) != NULL) {
-        fprintf(stderr, "Got arg |%s|, quoted = %d, mode = %d, error = %d\n", arg, quoted, quote, error);
-      if (!quoted && (strcmp(arg, ">") == 0 || strcmp(arg, ">>") == 0)) {
+    bool escaped;
+    while ((arg = read_arg(delim, &quoted, &escaped, &quote, &error)) != NULL) {
+      if (!quoted && !escaped && (strcmp(arg, ">") == 0 || strcmp(arg, ">>") == 0)) {
         long fd = STDOUT_FILENO;
         if (args.size > 0) {
           char *end;
@@ -728,7 +791,7 @@ int main(int argc, char **argv) {
           break;
         }
 
-        arg = read_arg(delim, &quoted, &quote, &error);
+        arg = read_arg(delim, &quoted, &escaped, &quote, &error);
         if (error || arg == NULL) {
           fprintf(stderr, "syntax error, missing filename of redirect\n");
           error = true;
