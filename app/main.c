@@ -75,7 +75,7 @@ typedef struct {
 ARRAY(command_t) builtins = {0};
 ARRAY(FILE *) files = {0};
 
-void close_open_files() {
+void close_open_files(void) {
   for (size_t i = 0; i < files.size; i ++) {
     if (files.data[i] != NULL) {
       fclose(files.data[i]);
@@ -447,6 +447,8 @@ char *read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote
     default:
       return _read_arg(delim, quoted, escaped, quote, error);
   }
+  UNREACHABLE();
+  return NULL;
 }
 
 extern char **environ;
@@ -481,7 +483,7 @@ int run_program(char *file_path, string_array args) {
         if (files.data[i] != NULL) {
           int fd = fileno(files.data[i]);
           close(i);
-          assert(dup2(fd, i) == i);
+          assert(dup2(fd, i) == (int)i);
         }
       }
       assert(execve(file_path, argv.data, environ) != -1);
@@ -534,6 +536,10 @@ int run_program(char *file_path, string_array args) {
         ENSURE_INPUT(stdout_buf);
         for (size_t i = stdout_buf.offset; i < stdout_buf.capacity; i ++) {
           printf("%c", stdout_buf.buffer[stdout_buf.offset++]);
+        }
+        ENSURE_INPUT(stderr_buf);
+        for (size_t i = stderr_buf.offset; i < stderr_buf.capacity; i ++) {
+          fprintf(stderr, "%c", stderr_buf.buffer[stderr_buf.offset++]);
         }
       }
       assert(waitpid(pid, &wstatus, 0) != -1);
@@ -687,6 +693,15 @@ int pwd_command(string_array args) {
   if (files.size > STDOUT_FILENO && files.data[STDOUT_FILENO] != NULL) {
     out = files.data[STDOUT_FILENO];
   }
+  FILE *err = stdout;
+  if (files.size > STDERR_FILENO && files.data[STDERR_FILENO] != NULL) {
+    err = files.data[STDERR_FILENO];
+  }
+
+  if (args.size > 1) {
+    fprintf(err, "pwd: arguments not supported yet\n");
+    return 1;
+  }
 
   char buf[4096] = {0};
   char *cwd = getcwd(buf, 4096);
@@ -722,6 +737,11 @@ int cd_command(string_array args) {
     err = files.data[STDERR_FILENO];
   }
 
+
+  if (args.size > 2) {
+    fprintf(err, "cd: too many arguments\n");
+    return 1;
+  }
   if (args.size > 2) {
     fprintf(err, "cd: too many arguments\n");
     return 1;
@@ -758,6 +778,11 @@ int main(int argc, char **argv) {
 
   // Flush after every printf
   setbuf(stdout, NULL);
+
+  if (argc > 1) {
+    fprintf(stderr, "%s: no arguments supported\n", argv[0]);
+    return 1;
+  }
 
   while (is_eof(&stdin_buf) == 0) {
     // FIXME read PS1
@@ -799,8 +824,8 @@ int main(int argc, char **argv) {
         }
         if (error) goto cont;
 
-        ARRAY_ENSURE_CAPACITY(files, fd + 1);
-        if (fd >= files.size) files.size = fd + 1;
+        ARRAY_ENSURE_CAPACITY(files, (size_t)fd + 1);
+        if ((size_t)fd >= files.size) files.size = (size_t)fd + 1;
         files.data[fd] = fopen(arg, append ? "a" : "w");
         free(arg);
       } else {
