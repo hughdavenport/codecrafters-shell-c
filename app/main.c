@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <assert.h>
 #include <poll.h>
 #include <termios.h>
@@ -18,6 +19,8 @@
 
 #define CTRL_C 003
 #define CTRL_D 004
+
+struct termios old_termios;
 
 typedef enum {
   UNQUOTED,
@@ -95,50 +98,95 @@ read_buffer stdin_buf = {
   .fd = STDIN_FILENO,
 };
 
-#define WAIT_FOR_INPUT(buf) do { \
-  assert((buf).offset >= (buf).capacity); \
-  struct pollfd fd = { \
-      .fd = (buf).fd, \
-      .events = POLLIN, \
-  }; \
-  if (poll(&fd, 1, -1) < 0) { \
-    (buf).eof = true; \
-  } else { \
-    assert(fd.revents != 0 && (fd.revents & POLLIN) != 0); \
-  } \
-} while (false)
 
-#define ENSURE_INPUT(buf) do { \
-  if ((buf).offset >= (buf).capacity) { \
-    WAIT_FOR_INPUT((buf)); \
-    if ((buf).eof) break; \
-    ssize_t n = read((buf).fd, (buf).buffer, sizeof((buf).buffer) - 1); \
-    assert(n >= 0); \
-    (buf).offset = 0; \
-    (buf).capacity = n; \
-    if (n == 0) (buf).eof = true; \
-  } \
-} while (false)
+bool read_input(read_buffer *buf, bool block) {
+  if (buf->eof) return false;
+  if (buf->offset >= buf->capacity) {
+    struct pollfd fd = {
+        .fd = buf->fd,
+        .events = POLLIN,
+    };
+    int p = 0;
+    while (p == 0) {
+      p = poll(&fd, 1, block ? -1 : 0);
+      if (p == -1) {
+        switch (errno) {
+          case EINTR:
+          case EAGAIN:
+            if (!block) return false;
+            p = 0;
+            continue;
+          default:
+            perror("poll");
+            abort();
+        }
+      }
+      if (p == 0 && !block) return false;
+      if (p != 1 || fd.revents == 0) {
+        fprintf(stderr, "poll: p = %d, fd.revents = %d\n", p, fd.revents);
+        abort();
+      }
+    }
+    if ((fd.revents & POLLIN) != 0) {
+      ssize_t n = read(buf->fd, buf->buffer, sizeof(buf->buffer) - 1);
+      if (n < 0) {
+        perror("read");
+        abort();
+      }
+      if (n == 0) {
+        assert(!block);
+        return false;
+      }
+      buf->offset = 0;
+      buf->capacity = n;
+      if ((fd.revents & (POLLERR|POLLHUP|POLLNVAL)) != 0) {
+        buf->eof = true;
+      }
+      return true;
+    } else if ((fd.revents & (POLLERR|POLLHUP|POLLNVAL)) != 0) {
+      buf->eof = true;
+      return false;
+    } else {
+      fprintf(stderr, "poll: fd.revents = %d\n", fd.revents);
+      abort();
+    }
+  }
+  return true;
+}
 
 char peek_char(read_buffer *buf) {
-  ENSURE_INPUT(*buf);
+  if (buf->eof) return EOF;
+  if (!read_input(buf, false)) {
+    return EOF; /* Non blocking, should check is_eof() */
+  }
   return buf->eof ? EOF : buf->buffer[buf->offset];
 }
 
 char read_char(read_buffer *buf) {
-  ENSURE_INPUT(*buf);
-  return buf->eof ? EOF : buf->buffer[buf->offset++];
+  if (buf->eof) return EOF;
+  if (!read_input(buf, true)) {
+    assert(buf->eof);
+    return EOF;
+  }
+  char c = buf->buffer[buf->offset++];
+  fprintf(stdout, "%c", c); /* echo */
+  return c;
 }
 
 bool is_eof(read_buffer *buf) {
-  /* ENSURE_INPUT(*buf); */
-  return buf->eof;
+  if (buf->eof) return true;
+  if (read_input(buf, true)) {
+    return false;
+  } else {
+    assert(buf->eof);
+    return true;
+  }
 }
 
 char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error) {
   ARRAY(char) ret = {0};
   *escaped = false;
-  while (peek_char(&stdin_buf) != EOF && (*quote != UNQUOTED || strchr(delim, peek_char(&stdin_buf)) == NULL)) {
+  while (!is_eof(&stdin_buf) && (*quote != UNQUOTED || strchr(delim, peek_char(&stdin_buf)) == NULL)) {
     if (!*escaped && *quote == UNQUOTED) {
       if (ret.size == 1 && ret.data[0] == '>') {
         if (peek_char(&stdin_buf) == '>') ARRAY_ADD(ret, read_char(&stdin_buf));
@@ -281,6 +329,9 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
       case '\n':
         // FIXME read PS2
         printf("> ");
+        ARRAY_ADD(ret, peek_char(&stdin_buf));
+        break;
+
       default:
         ARRAY_ADD(ret, peek_char(&stdin_buf));
         break;
@@ -420,7 +471,7 @@ char *read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote
   assert(*quote == UNQUOTED);
   *quoted = false;
 
-  while (peek_char(&stdin_buf) != EOF &&
+  while (!is_eof(&stdin_buf) &&
       peek_char(&stdin_buf) != '\n' &&
       strchr(delim, peek_char(&stdin_buf)) != NULL) {
     read_char(&stdin_buf);
@@ -461,89 +512,289 @@ int run_program(char *file_path, string_array args) {
   int stdin_pipe[2];
   int stdout_pipe[2];
   int stderr_pipe[2];
-  assert(pipe(stdin_pipe) == 0);
-  assert(pipe(stdout_pipe) == 0);
-  assert(pipe(stderr_pipe) == 0);
+  if (pipe(stdin_pipe) != 0) { perror("pipe stdin"); abort(); }
+  if (pipe(stdout_pipe) != 0) { perror("pipe stdout"); abort(); }
+  if (pipe(stderr_pipe) != 0) { perror("pipe stderr"); abort(); }
   pid_t pid = fork();
   switch (pid) {
     case -1:
-      assert(false && "Out of memory");
+      perror("fork");
+      abort();
       UNREACHABLE();
       return -1;
 
     case 0:
       // FIXME get stdin working, pipe maybe
-      assert(close(stdin_pipe[1]) != -1);
-      assert(close(stdout_pipe[0]) != -1);
-      assert(close(stderr_pipe[0]) != -1);
-      assert(dup2(stdin_pipe[0], STDIN_FILENO) != -1);
-      assert(dup2(stdout_pipe[1], STDOUT_FILENO) != -1);
-      assert(dup2(stderr_pipe[1], STDERR_FILENO) != -1);
+      if (close(stdin_pipe[1]) == -1) { perror("child close stdin_pipe[1]"); abort(); }
+      if (close(stdout_pipe[0]) == -1) { perror("child close stdout_pipe[0]"); abort(); }
+      if (close(stderr_pipe[0]) == -1) { perror("child close stderr_pipe[0]"); abort(); }
+      if (dup2(stdin_pipe[0], STDIN_FILENO) == -1) { perror("child dup2 stdin"); abort(); }
+      if (dup2(stdout_pipe[1], STDOUT_FILENO) == -1) { perror("child dup2 stdout"); abort(); }
+      if (dup2(stderr_pipe[1], STDERR_FILENO) == -1) { perror("child dup2 stderr"); abort(); }
       for (size_t i = 0; i < files.size; i ++) {
         if (files.data[i] != NULL) {
           int fd = fileno(files.data[i]);
           close(i);
-          assert(dup2(fd, i) == (int)i);
+          if (dup2(fd, i) == -1) { perror("child dup2 files"); abort(); }
         }
       }
-      assert(execve(file_path, argv.data, environ) != -1);
+      if (execve(file_path, argv.data, environ) == -1) {
+        perror("execve");
+        abort();
+      }
       UNREACHABLE();
       return -1;
 
     default: {
       ARRAY_FREE(argv);
-      assert(close(stdin_pipe[0]) != -1);
-      assert(close(stdout_pipe[1]) != -1);
-      assert(close(stderr_pipe[1]) != -1);
+      if (close(stdin_pipe[0]) == -1) { perror("parent close stdin_pipe[0]"); abort(); }
+      if (close(stdout_pipe[1]) == -1) { perror("parent close stdout_pipe[1]"); abort(); }
+      if (close(stderr_pipe[1]) == -1) { perror("parent close stderr_pipe[1]"); abort(); }
       int wstatus = 0;
+      pid_t wait_ret;
+      bool eof = false;
+      read_buffer child_stdout_buf = {
+        .fd = stdout_pipe[0],
+      };
+      read_buffer child_stderr_buf = {
+        .fd = stderr_pipe[0],
+      };
+
+wait_loop:
       while (true) {
-        pid_t wait_ret = waitpid(pid, &wstatus, WNOHANG);
-        assert(wait_ret != -1);
-        if (wait_ret != 0) fprintf(stderr, "wait returned %d, wstatus = %d\n", wait_ret, wstatus);
-        if (wait_ret != 0 && WIFEXITED(wstatus)) break;
+        wait_ret = waitpid(pid, &wstatus, WNOHANG);
+        if (wait_ret == -1) {
+          switch (errno) {
+            case EAGAIN:
+              continue;
 
-        // FIXME do a poll on all of these buffers
-        read_buffer stdout_buf = {
-          .fd = stdout_pipe[0],
-        };
-        read_buffer stderr_buf = {
-          .fd = stderr_pipe[0],
-        };
-
-        ENSURE_INPUT(stdin_buf);
-        size_t to_write = stdin_buf.capacity - stdin_buf.offset;
-        for (size_t i = 0; i < to_write; i ++) {
-          switch (stdin_buf.buffer[stdin_buf.offset + i]) {
-            case CTRL_C:
-              fprintf(stderr, "Ctrl-C in run_program\n");
-              break;
-
-            case CTRL_D:
-              fprintf(stderr, "Ctrl-D in run_program\n");
-              break;
+            case ECHILD:
+              goto wait_loop;
 
             default:
-              fprintf(stderr, "Sending '%c'\n", stdin_buf.buffer[stdin_buf.offset + i]);
+              perror("waitpid(pid, &status, WNOHANG)");
+              abort();
           }
         }
-        while (to_write > 0) {
-          ssize_t ret = write(stdin_pipe[1], stdin_buf.buffer + stdin_buf.offset, to_write);
-          assert(ret >= 0);
-          assert(ret > 0);
-          stdin_buf.offset += ret;
-          to_write -= ret;
+        if (wait_ret != 0) break;
+
+        if (!eof && read_input(&stdin_buf, false)) {
+          size_t to_write = stdin_buf.capacity - stdin_buf.offset;
+          for (size_t i = 0; i < to_write; i ++) {
+            switch (stdin_buf.buffer[stdin_buf.offset + i]) {
+              case CTRL_C: {
+                // Write what was read up to the ^C out, then signal. Continue on from the byte after this
+                int tmp = to_write;
+                int off = stdin_buf.offset;
+                to_write = i;
+                while (to_write > 0) {
+                  ssize_t ret = write(stdin_pipe[1], stdin_buf.buffer + stdin_buf.offset, to_write);
+                  if (ret == -1) {
+                    switch (errno) {
+                      case EAGAIN:
+                      case EINTR:
+                        continue;
+
+                      case EPIPE:
+                        to_write = 0;
+                        goto sigint;
+
+                      default:
+                        perror("parent write before sigint");
+                        abort();
+                    }
+                  }
+                  stdin_buf.offset += ret;
+                  to_write -= ret;
+                }
+                // echo
+                to_write = i;
+                stdin_buf.offset = off;
+                while (to_write > 0) {
+                  ssize_t ret = write(STDOUT_FILENO, stdin_buf.buffer + stdin_buf.offset, to_write);
+                  if (ret == -1) {
+                    switch (errno) {
+                      case EAGAIN:
+                      case EINTR:
+                        continue;
+
+                      case EPIPE:
+                        to_write = 0;
+                        goto sigint;
+
+                      default:
+                        perror("parent write echo before sigint");
+                        abort();
+                    }
+                  }
+                  stdin_buf.offset += ret;
+                  to_write -= ret;
+                }
+                stdin_buf.offset ++;
+                to_write = tmp - i - 1;
+                i = 0;
+sigint:
+                if (kill(pid, SIGINT) == -1) {
+                  perror("kill sigint");
+                  abort();
+                }
+              }; break;
+
+              case CTRL_D: {
+                // Write out up to here, set EOF
+                int off = stdin_buf.offset;
+                to_write = i;
+                while (to_write > 0) {
+                  ssize_t ret = write(stdin_pipe[1], stdin_buf.buffer + stdin_buf.offset, to_write);
+                  if (ret == -1) {
+                    switch (errno) {
+                      case EAGAIN:
+                      case EINTR:
+                        continue;
+
+                      case EPIPE:
+                        to_write = 0;
+                        goto sigint;
+
+                      default:
+                        perror("parent write before eof");
+                        abort();
+                    }
+                  }
+                  stdin_buf.offset += ret;
+                  to_write -= ret;
+                }
+                // echo
+                to_write = i;
+                stdin_buf.offset = off;
+                while (to_write > 0) {
+                  ssize_t ret = write(STDOUT_FILENO, stdin_buf.buffer + stdin_buf.offset, to_write);
+                  if (ret == -1) {
+                    switch (errno) {
+                      case EAGAIN:
+                      case EINTR:
+                        continue;
+
+                      case EPIPE:
+                        to_write = 0;
+                        goto sigint;
+
+                      default:
+                        perror("parent write echo before eof");
+                        abort();
+                    }
+                  }
+                  stdin_buf.offset += ret;
+                  to_write -= ret;
+                }
+                stdin_buf.offset ++;
+                to_write = 0;
+                i = 0;
+                eof = true;
+                while (close(stdin_pipe[1]) == -1) {
+                  if (errno == EINTR) continue;
+                  perror("parent close stdin");
+                  abort();
+                  break;
+                }
+              }; break;
+            }
+          }
+          int tmp = to_write;
+          int off = stdin_buf.offset;
+          while (to_write > 0) {
+            ssize_t ret = write(stdin_pipe[1], stdin_buf.buffer + stdin_buf.offset, to_write);
+            if (ret == -1) {
+              switch (errno) {
+                case EAGAIN:
+                case EINTR:
+                  continue;
+
+                case EPIPE:
+                  to_write = 0;
+                  continue;
+
+                default:
+                  perror("parent write");
+                  abort();
+              }
+            }
+            stdin_buf.offset += ret;
+            to_write -= ret;
+          }
+          to_write = tmp;
+          stdin_buf.offset = off;
+          while (to_write > 0) {
+            ssize_t ret = write(STDOUT_FILENO, stdin_buf.buffer + stdin_buf.offset, to_write);
+            if (ret == -1) {
+              switch (errno) {
+                case EAGAIN:
+                case EINTR:
+                  continue;
+
+                case EPIPE:
+                  to_write = 0;
+                  continue;
+
+                default:
+                  perror("parent write echo");
+                  abort();
+              }
+            }
+            stdin_buf.offset += ret;
+            to_write -= ret;
+          }
         }
-        ENSURE_INPUT(stdout_buf);
-        for (size_t i = stdout_buf.offset; i < stdout_buf.capacity; i ++) {
-          printf("%c", stdout_buf.buffer[stdout_buf.offset++]);
+        if (read_input(&child_stdout_buf, eof)) {
+          size_t to_write = child_stdout_buf.capacity - child_stdout_buf.offset;
+          while (to_write > 0) {
+            ssize_t ret = write(STDOUT_FILENO, child_stdout_buf.buffer + child_stdout_buf.offset, to_write);
+            if (ret == -1) {
+              switch (errno) {
+                case EAGAIN:
+                case EINTR:
+                  continue;
+
+                default:
+                  perror("stdout write");
+                  abort();
+              }
+            }
+            to_write -= ret;
+            child_stdout_buf.offset += ret;
+          }
         }
-        ENSURE_INPUT(stderr_buf);
-        for (size_t i = stderr_buf.offset; i < stderr_buf.capacity; i ++) {
-          fprintf(stderr, "%c", stderr_buf.buffer[stderr_buf.offset++]);
+        if (read_input(&child_stderr_buf, eof)) {
+          size_t to_write = child_stderr_buf.capacity - child_stderr_buf.offset;
+          while (to_write > 0) {
+            ssize_t ret = write(STDERR_FILENO, child_stderr_buf.buffer + child_stderr_buf.offset, to_write);
+            if (ret == -1) {
+              switch (errno) {
+                case EAGAIN:
+                case EINTR:
+                  continue;
+
+                default:
+                  perror("stderr write");
+                  abort();
+              }
+            }
+            to_write -= ret;
+            child_stderr_buf.offset += ret;
+          }
         }
       }
-      assert(waitpid(pid, &wstatus, 0) != -1);
-      return WEXITSTATUS(wstatus);
+      // FIXME put the stdin_buf back into stdin
+      if (WIFEXITED(wstatus)) {
+        return WEXITSTATUS(wstatus);
+      } else if (WIFSIGNALED(wstatus)) {
+        return 128 + WTERMSIG(wstatus);
+      } else if (WIFSTOPPED(wstatus)) {
+        return 128 + WSTOPSIG(wstatus);
+      } else {
+        perror("waitpid");
+        fprintf(stderr, "wait returned %d, wstatus = %d\n", wait_ret, wstatus);
+      }
     }
   }
   UNREACHABLE();
@@ -760,11 +1011,10 @@ int cd_command(string_array args) {
 }
 
 int main(int argc, char **argv) {
-  struct termios old_termios;
   if (tcgetattr(STDIN_FILENO, &old_termios) == 0) {
     struct termios term = old_termios;
     term = old_termios;
-    term.c_lflag &= ~(ICANON|ISIG);
+    term.c_lflag &= ~(ICANON|ISIG|ECHO);
     term.c_cc[VTIME] = 0;
     term.c_cc[VMIN] = 0;
     assert(tcsetattr(STDIN_FILENO, TCSANOW, &term) == 0);
@@ -784,9 +1034,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  while (is_eof(&stdin_buf) == 0) {
-    // FIXME read PS1
-    printf("$ ");
+  // FIXME read PS1
+  printf("$ ");
+  do {
 
     char *delim = " \n";
     string_array args = {0};
@@ -896,7 +1146,9 @@ cont:
       args.data[i] = NULL;
     }
     ARRAY_FREE(args);
-  }
+    // FIXME read PS1
+    printf("$ ");
+  } while (!is_eof(&stdin_buf));
 
   close_open_files();
   ARRAY_FREE(files);
