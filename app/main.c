@@ -1,3 +1,5 @@
+#include <sys/stat.h>
+#include <ctype.h>
 #include <assert.h>
 #include <poll.h>
 #include <termios.h>
@@ -13,11 +15,10 @@
 
 #include <sys/wait.h>
 
-#define UNIMPLENTED(msg) do { fprintf(stderr, "%s:%d: UNIMPLENTED: %s", __FILE__, __LINE__, msg); exit(1); } while (false)
-#define UNREACHABLE() do { fprintf(stderr, "%s:%d: UNREACHABLE", __FILE__, __LINE__); exit(1); } while (false)
-
 #define CTRL_C 003
 #define CTRL_D 004
+
+struct termios *old_termios_ptr = NULL;
 
 typedef enum {
   UNQUOTED,
@@ -35,7 +36,10 @@ struct { \
 #define ARRAY_ENSURE_CAPACITY(arr, cap) do { \
   if ((cap) > (arr).capacity) { \
     (arr).data = realloc((arr).data, sizeof((arr).data[0]) * (cap)); \
-    assert((arr).data != NULL); \
+    if ((arr).data == NULL) { \
+        perror("ARRAY_ENSURE_CAPACITY realloc"); \
+        ABORT(); \
+    } \
     memset((arr).data + sizeof((arr).data[0]) * (arr).capacity, \
         '\0', sizeof((arr).data[0]) * ((cap) - (arr).capacity)); \
     (arr).capacity = (cap); \
@@ -84,6 +88,23 @@ void close_open_files(void) {
   }
 }
 
+void cleanup(void) {
+  close_open_files();
+  ARRAY_FREE(files);
+  ARRAY_FREE(builtins);
+  if (old_termios_ptr != NULL) {
+    if (tcsetattr(STDIN_FILENO, TCSANOW, old_termios_ptr) != 0) perror("cleanup tcsetattr");
+  }
+}
+
+int exit_command(string_array args);
+
+#define ABORT() do { cleanup(); abort(); } while (0)
+
+#define UNIMPLEMENTED(msg) do { fprintf(stderr, "%s:%d: UNIMPLEMENTED: %s", __FILE__, __LINE__, msg); ABORT(); } while (false)
+#define UNREACHABLE() do { fprintf(stderr, "%s:%d: UNREACHABLE", __FILE__, __LINE__); ABORT(); } while (false)
+
+
 typedef struct {
   char buffer[4097];
   size_t capacity;
@@ -95,50 +116,162 @@ read_buffer stdin_buf = {
   .fd = STDIN_FILENO,
 };
 
-#define WAIT_FOR_INPUT(buf) do { \
-  assert((buf).offset >= (buf).capacity); \
-  struct pollfd fd = { \
-      .fd = (buf).fd, \
-      .events = POLLIN, \
-  }; \
-  if (poll(&fd, 1, -1) < 0) { \
-    (buf).eof = true; \
-  } else { \
-    assert(fd.revents != 0 && (fd.revents & POLLIN) != 0); \
-  } \
-} while (false)
 
-#define ENSURE_INPUT(buf) do { \
-  if ((buf).offset >= (buf).capacity) { \
-    WAIT_FOR_INPUT((buf)); \
-    if ((buf).eof) break; \
-    ssize_t n = read((buf).fd, (buf).buffer, sizeof((buf).buffer) - 1); \
-    assert(n >= 0); \
-    (buf).offset = 0; \
-    (buf).capacity = n; \
-    if (n == 0) (buf).eof = true; \
-  } \
-} while (false)
+bool read_input(read_buffer *buf, bool block) {
+  if (buf->eof) return buf->offset < buf->capacity;
+  if (block && buf->offset < buf->capacity) return true;
+  size_t cur_size = buf->capacity - buf->offset;
+  if (cur_size < sizeof(buf->buffer) / 2) {
+    struct pollfd fd = {
+        .fd = buf->fd,
+        .events = POLLIN,
+    };
+    int p = 0;
+    while (p == 0) {
+      p = poll(&fd, 1, block ? -1 : 0);
+      if (p == -1) {
+        switch (errno) {
+          case EINTR:
+            p = 0;
+            continue;
+
+          default:
+            perror("poll");
+            ABORT();
+        }
+      }
+      if (p == 0) {
+        if (block) {
+          buf->eof = true;
+        }
+        return !buf->eof || buf->offset < buf->capacity;
+      }
+      if (p != 1 || fd.revents == 0) {
+        fprintf(stderr, "poll: p = %d, fd.revents = %d\n", p, fd.revents);
+        ABORT();
+      }
+    }
+    if ((fd.revents & (POLLIN|POLLHUP)) != 0) {
+      if (buf->offset > 0 && buf->offset == buf->capacity) {
+        buf->offset = 0;
+        buf->capacity = 0;
+      }
+      assert(buf->offset <= buf->capacity);
+      if (buf->offset > sizeof(buf->buffer) / 2) {
+        size_t cap = buf->capacity - buf->offset;
+        memcpy(buf->buffer, buf->buffer + buf->offset, cap);
+        buf->offset = 0;
+      }
+      ssize_t n = read(buf->fd, buf->buffer + buf->capacity, sizeof(buf->buffer) - buf->capacity - 1);
+      if (n < 0) {
+        perror("read");
+        ABORT();
+      }
+      if (n == 0) {
+        if (block && (fd.revents & POLLIN) == 0) {
+          buf->eof = true;
+          return buf->offset < buf->capacity;
+        }
+        return !buf->eof || buf->offset < buf->capacity;
+      }
+      buf->capacity += n;
+      return true;
+    } else if ((fd.revents & (POLLNVAL)) != 0) {
+      buf->eof = true;
+      return false;
+    } else {
+      fprintf(stderr, "poll: fd.revents = %d\n", fd.revents);
+      ABORT();
+    }
+  }
+  return true;
+}
 
 char peek_char(read_buffer *buf) {
-  ENSURE_INPUT(*buf);
+  if (buf->eof) return EOF;
+  if (!read_input(buf, false)) {
+    return EOF; /* Non blocking, should check is_eof() */
+  }
   return buf->eof ? EOF : buf->buffer[buf->offset];
 }
 
 char read_char(read_buffer *buf) {
-  ENSURE_INPUT(*buf);
-  return buf->eof ? EOF : buf->buffer[buf->offset++];
+  if (buf->eof) return EOF;
+  if (!read_input(buf, true)) {
+    assert(buf->eof);
+    return EOF;
+  }
+  char c = buf->buffer[buf->offset++];
+  fprintf(stdout, "%c", c); /* echo */
+  return c;
 }
 
 bool is_eof(read_buffer *buf) {
-  /* ENSURE_INPUT(*buf); */
-  return buf->eof;
+  if (read_input(buf, true)) {
+    return false;
+  } else {
+    assert(buf->eof);
+    return true;
+  }
+}
+
+void drain_buffer_size(int fd, read_buffer *buf, size_t to_write, bool echo) {
+  if (to_write == 0) return;
+  assert(to_write <= buf->capacity - buf->offset);
+  if (echo && fd != STDOUT_FILENO) {
+    int orig_offset = buf->offset;
+    printf("echo:|");
+    drain_buffer_size(STDOUT_FILENO, buf, to_write, false);
+    printf("|\n");
+    buf->offset = orig_offset;
+  }
+  while (to_write > 0) {
+    ssize_t ret = write(fd, buf->buffer + buf->offset, to_write);
+    if (ret == -1) {
+      switch (errno) {
+        case EAGAIN:
+        case EINTR:
+          continue;
+
+        default:
+          perror("drain buffer write");
+          ABORT();
+      }
+    }
+    to_write -= ret;
+    buf->offset += ret;
+  }
+}
+
+void read_and_drain_buffer(int fd, read_buffer *buf, bool blocking, bool buffer_lines, bool echo) {
+  bool loop = true;
+  while (loop && read_input(buf, blocking)) {
+    if (!blocking) loop = false;
+    size_t to_write = buf->capacity - buf->offset;
+    if (to_write == 0) return;
+    size_t orig_write = to_write;
+    if (buffer_lines) {
+      while (to_write > 0 && buf->buffer[buf->offset + to_write - 1] != '\n') {
+        to_write --;
+      }
+    }
+    if (to_write == 0) return;
+    if (buffer_lines && to_write != orig_write) {
+      printf("stripped: |");
+      write(STDOUT_FILENO, buf->buffer + buf->offset + to_write, orig_write - to_write);
+      printf("|\n");
+    }
+    // FIXME this could block...
+    // Need to poll the write, and check if no POLLERR
+    // and if non blocking we just wait?
+    drain_buffer_size(fd, buf, to_write, echo);
+  }
 }
 
 char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error) {
   ARRAY(char) ret = {0};
   *escaped = false;
-  while (peek_char(&stdin_buf) != EOF && (*quote != UNQUOTED || strchr(delim, peek_char(&stdin_buf)) == NULL)) {
+  while (!*error && !is_eof(&stdin_buf) && (*quote != UNQUOTED || strchr(delim, peek_char(&stdin_buf)) == NULL)) {
     if (!*escaped && *quote == UNQUOTED) {
       if (ret.size == 1 && ret.data[0] == '>') {
         if (peek_char(&stdin_buf) == '>') ARRAY_ADD(ret, read_char(&stdin_buf));
@@ -152,46 +285,67 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
 
     switch (peek_char(&stdin_buf)) {
       case EOF:
+        UNREACHABLE();
+        ARRAY_FREE(ret);
         *error = true;
+        return NULL;
         break;
 
       case CTRL_C: {
+        printf("^C\n");
+        stdin_buf.offset++;
         ARRAY_FREE(ret);
         *error = true;
         return NULL;
       }; break;
 
       case CTRL_D: {
-        UNIMPLENTED("EOF mid arg");
+        printf("\a");
       }; break;
 
       case '\\': {
         switch (*quote) {
           case DOUBLE: {
             read_char(&stdin_buf);
-            switch (peek_char(&stdin_buf)) {
+check_double_escape:
+            if (!is_eof(&stdin_buf)) switch (peek_char(&stdin_buf)) {
               case EOF:
+                UNREACHABLE();
+                ARRAY_FREE(ret);
+                *error = true;
+                return NULL;
                 break;
 
               case CTRL_C: {
-                UNIMPLENTED("CTRL-C mid arg");
+                *error = true;
+                printf("^C\n");
+                stdin_buf.offset ++;
+                ARRAY_FREE(ret);
+                return NULL;
               }; break;
 
               case CTRL_D: {
-                UNIMPLENTED("EOF mid arg");
+                printf("\a");
+                stdin_buf.offset ++;
+                goto check_double_escape;
               }; break;
 
               case '\n':
                 // FIXME read PS2
-                printf("> ");
-                // fallthrough
+                printf("\n> ");
+                *escaped = true;
+                // consume with no echo
+                ARRAY_ADD(ret, peek_char(&stdin_buf));
+                stdin_buf.offset ++;
+                continue;
+
               case '\\':
               case '$':
               case '"':
               case '>':
                 *escaped = true;
-                ARRAY_ADD(ret, peek_char(&stdin_buf));
-                break;
+                ARRAY_ADD(ret, read_char(&stdin_buf));
+                continue;
 
               default:
                 *escaped = true;
@@ -205,30 +359,38 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
             ARRAY_ADD(ret, peek_char(&stdin_buf));
             break;
 
-          case UNQUOTED:
+          case UNQUOTED: {
             read_char(&stdin_buf);
-            switch (peek_char(&stdin_buf)) {
+check_unquoted_escape:
+            if (!is_eof(&stdin_buf)) switch (peek_char(&stdin_buf)) {
               case EOF:
                 break;
 
               case CTRL_C: {
-                UNIMPLENTED("CTRL-C mid arg");
+                *error = true;
+                printf("^C\n");
+                stdin_buf.offset ++;
+                ARRAY_FREE(ret);
+                return NULL;
               }; break;
 
               case CTRL_D: {
-                UNIMPLENTED("EOF mid arg");
+                printf("\a");
+                stdin_buf.offset ++;
+                goto check_unquoted_escape;
               }; break;
 
               case '\n':
                 // FIXME read PS2
-                printf("> ");
-                break;
+                printf("\n> ");
+                stdin_buf.offset ++;
+                continue;
 
               default:
                 ARRAY_ADD(ret, peek_char(&stdin_buf));
                 break;
             }
-            break;
+          }; break;
 
           default:
             UNREACHABLE();
@@ -280,14 +442,18 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
 
       case '\n':
         // FIXME read PS2
-        printf("> ");
+        printf("\n> ");
+        ARRAY_ADD(ret, peek_char(&stdin_buf));
+        stdin_buf.offset ++;
+        continue;
+
       default:
         ARRAY_ADD(ret, peek_char(&stdin_buf));
         break;
     }
     if (!*error) read_char(&stdin_buf);
   }
-  if (is_eof(&stdin_buf)) {
+  if (*quote != UNQUOTED && is_eof(&stdin_buf)) {
     ARRAY_FREE(ret);
     switch (*quote) {
       case SINGLE:
@@ -301,8 +467,6 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
         break;
 
       case UNQUOTED:
-        break;
-
       default:
         UNREACHABLE();
         break;
@@ -316,8 +480,10 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
 
 char *_read_tilde_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error) {
   assert(*quote == UNQUOTED);
-  assert(!is_eof(&stdin_buf));
   assert(read_char(&stdin_buf) == '~');
+
+start_read_tilde_arg:
+  assert(!is_eof(&stdin_buf));
   struct passwd *passwd = NULL;
 
   if (peek_char(&stdin_buf) == '\0' || strchr(delim, peek_char(&stdin_buf)) != NULL) {
@@ -334,15 +500,21 @@ char *_read_tilde_arg(const char *delim, bool *quoted, bool *escaped, quote_mode
       break;
 
     case CTRL_C: {
-      UNIMPLENTED("Ctrl-C mid arg");
+      *error = true;
+      printf("^C\n");
+      stdin_buf.offset ++;
+      return NULL;
     }; break;
 
     case CTRL_D: {
-      UNIMPLENTED("EOF mid arg");
+      printf("\a");
+      stdin_buf.offset ++;
+      goto start_read_tilde_arg;
     }; break;
 
     case '/': {
       char *arg = _read_arg(delim, quoted, escaped, quote, error);
+      if (*error || arg == NULL) return NULL;
       char *home = getenv("HOME");
       if (home == NULL) {
         size_t arg_len = strlen(arg);
@@ -367,10 +539,29 @@ char *_read_tilde_arg(const char *delim, bool *quoted, bool *escaped, quote_mode
     default: {
       // ~user
       ARRAY(char) username = {0};
-      read_char(&stdin_buf);
-      while (peek_char(&stdin_buf) != '\0' &&
+      while (!is_eof(&stdin_buf) &&
+          peek_char(&stdin_buf) != '\0' &&
           peek_char(&stdin_buf) != '/' &&
           strchr(delim, peek_char(&stdin_buf)) == NULL) {
+        if (iscntrl(peek_char(&stdin_buf))) {
+          switch (peek_char(&stdin_buf)) {
+            case CTRL_C:
+              *error = true;
+              printf("^C\n");
+              stdin_buf.offset ++;
+              ARRAY_FREE(username);
+              return NULL;
+
+            case CTRL_D:
+              printf("\a");
+              stdin_buf.offset ++;
+              continue;
+
+            default:
+              printf("Code %d\n", peek_char(&stdin_buf));
+              UNIMPLEMENTED("Unhandled cntrl char in ~user");
+          }
+        }
         ARRAY_ADD(username, read_char(&stdin_buf));
       }
       while ((passwd = getpwent()) != NULL) {
@@ -385,6 +576,7 @@ char *_read_tilde_arg(const char *delim, bool *quoted, bool *escaped, quote_mode
 
           if (peek_char(&stdin_buf) == '/') {
             char *arg = _read_arg(delim, quoted, escaped, quote, error);
+            if (*error || arg == NULL) return NULL;
             size_t dir_len = strlen(passwd->pw_dir);
             size_t arg_len = strlen(arg);
             char *full_path = malloc(dir_len + arg_len + 1);
@@ -401,6 +593,7 @@ char *_read_tilde_arg(const char *delim, bool *quoted, bool *escaped, quote_mode
       endpwent();
       // Haven't found user, fall out
       char *arg = _read_arg(delim, quoted, escaped, quote, error);
+      if (*error || arg == NULL) return NULL;
       size_t arg_len = strlen(arg);
       char *ret = malloc(username.size + arg_len + 2);
       assert(ret != NULL);
@@ -413,14 +606,16 @@ char *_read_tilde_arg(const char *delim, bool *quoted, bool *escaped, quote_mode
       return ret;
     }; break;
   }
+  UNREACHABLE();
   return _read_arg(delim, quoted, escaped, quote, error);
 }
 
-char *read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error) {
+char *read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error, bool first) {
   assert(*quote == UNQUOTED);
   *quoted = false;
 
-  while (peek_char(&stdin_buf) != EOF &&
+start_read_arg:
+  while (!is_eof(&stdin_buf) &&
       peek_char(&stdin_buf) != '\n' &&
       strchr(delim, peek_char(&stdin_buf)) != NULL) {
     read_char(&stdin_buf);
@@ -428,11 +623,22 @@ char *read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote
 
   switch (peek_char(&stdin_buf)) {
     case CTRL_C: {
-      UNIMPLENTED("Ctrl-C start arg");
+      printf("^C\n");
+      stdin_buf.offset ++;
+      return NULL;
     }; break;
 
     case CTRL_D: {
-      UNIMPLENTED("EOF start arg");
+      if (first) {
+        printf("\n");
+        stdin_buf.offset = stdin_buf.capacity;
+        stdin_buf.eof = true;
+        return NULL;
+      } else {
+        printf("\a");
+        stdin_buf.offset ++;
+        goto start_read_arg;
+      }
     }; break;
 
     case '~':
@@ -461,89 +667,127 @@ int run_program(char *file_path, string_array args) {
   int stdin_pipe[2];
   int stdout_pipe[2];
   int stderr_pipe[2];
-  assert(pipe(stdin_pipe) == 0);
-  assert(pipe(stdout_pipe) == 0);
-  assert(pipe(stderr_pipe) == 0);
+  if (pipe(stdin_pipe) != 0) { perror("pipe stdin"); ABORT(); }
+  if (pipe(stdout_pipe) != 0) { perror("pipe stdout"); ABORT(); }
+  if (pipe(stderr_pipe) != 0) { perror("pipe stderr"); ABORT(); }
   pid_t pid = fork();
   switch (pid) {
     case -1:
-      assert(false && "Out of memory");
+      perror("fork");
+      ABORT();
       UNREACHABLE();
       return -1;
 
     case 0:
       // FIXME get stdin working, pipe maybe
-      assert(close(stdin_pipe[1]) != -1);
-      assert(close(stdout_pipe[0]) != -1);
-      assert(close(stderr_pipe[0]) != -1);
-      assert(dup2(stdin_pipe[0], STDIN_FILENO) != -1);
-      assert(dup2(stdout_pipe[1], STDOUT_FILENO) != -1);
-      assert(dup2(stderr_pipe[1], STDERR_FILENO) != -1);
+      if (close(stdin_pipe[1]) == -1) { perror("child close stdin_pipe[1]"); ABORT(); }
+      if (close(stdout_pipe[0]) == -1) { perror("child close stdout_pipe[0]"); ABORT(); }
+      if (close(stderr_pipe[0]) == -1) { perror("child close stderr_pipe[0]"); ABORT(); }
+      if (dup2(stdin_pipe[0], STDIN_FILENO) == -1) { perror("child dup2 stdin"); ABORT(); }
+      if (dup2(stdout_pipe[1], STDOUT_FILENO) == -1) { perror("child dup2 stdout"); ABORT(); }
+      if (dup2(stderr_pipe[1], STDERR_FILENO) == -1) { perror("child dup2 stderr"); ABORT(); }
       for (size_t i = 0; i < files.size; i ++) {
         if (files.data[i] != NULL) {
           int fd = fileno(files.data[i]);
           close(i);
-          assert(dup2(fd, i) == (int)i);
+          if (dup2(fd, i) == -1) { perror("child dup2 files"); ABORT(); }
         }
       }
-      assert(execve(file_path, argv.data, environ) != -1);
+      if (execve(file_path, argv.data, environ) == -1) {
+        perror("execve");
+        abort();
+      }
       UNREACHABLE();
       return -1;
 
     default: {
       ARRAY_FREE(argv);
-      assert(close(stdin_pipe[0]) != -1);
-      assert(close(stdout_pipe[1]) != -1);
-      assert(close(stderr_pipe[1]) != -1);
+      if (close(stdin_pipe[0]) == -1) { perror("parent close stdin_pipe[0]"); ABORT(); }
+      if (close(stdout_pipe[1]) == -1) { perror("parent close stdout_pipe[1]"); ABORT(); }
+      if (close(stderr_pipe[1]) == -1) { perror("parent close stderr_pipe[1]"); ABORT(); }
       int wstatus = 0;
+      pid_t wait_ret;
+      bool eof = false;
+      read_buffer child_stdout_buf = {
+        .fd = stdout_pipe[0],
+      };
+      read_buffer child_stderr_buf = {
+        .fd = stderr_pipe[0],
+      };
+      int child_stdin_fd = stdin_pipe[1];
+
+wait_loop:
       while (true) {
-        pid_t wait_ret = waitpid(pid, &wstatus, WNOHANG);
-        assert(wait_ret != -1);
-        if (wait_ret != 0) fprintf(stderr, "wait returned %d, wstatus = %d\n", wait_ret, wstatus);
-        if (wait_ret != 0 && WIFEXITED(wstatus)) break;
+        wait_ret = waitpid(pid, &wstatus, WNOHANG);
+        if (wait_ret == -1) {
+          switch (errno) {
+            case EAGAIN:
+              continue;
 
-        // FIXME do a poll on all of these buffers
-        read_buffer stdout_buf = {
-          .fd = stdout_pipe[0],
-        };
-        read_buffer stderr_buf = {
-          .fd = stderr_pipe[0],
-        };
-
-        ENSURE_INPUT(stdin_buf);
-        size_t to_write = stdin_buf.capacity - stdin_buf.offset;
-        for (size_t i = 0; i < to_write; i ++) {
-          switch (stdin_buf.buffer[stdin_buf.offset + i]) {
-            case CTRL_C:
-              fprintf(stderr, "Ctrl-C in run_program\n");
-              break;
-
-            case CTRL_D:
-              fprintf(stderr, "Ctrl-D in run_program\n");
-              break;
+            case ECHILD:
+              goto wait_loop;
 
             default:
-              fprintf(stderr, "Sending '%c'\n", stdin_buf.buffer[stdin_buf.offset + i]);
+              perror("waitpid(pid, &status, WNOHANG)");
+              ABORT();
           }
         }
-        while (to_write > 0) {
-          ssize_t ret = write(stdin_pipe[1], stdin_buf.buffer + stdin_buf.offset, to_write);
-          assert(ret >= 0);
-          assert(ret > 0);
-          stdin_buf.offset += ret;
-          to_write -= ret;
+        if (wait_ret != 0) break;
+
+        // FIXME Check if write eof as well
+        if (!eof && read_input(&stdin_buf, false)) {
+          size_t to_write = stdin_buf.capacity - stdin_buf.offset;
+          for (size_t i = 0; i < to_write; i ++) {
+            switch (stdin_buf.buffer[stdin_buf.offset + i]) {
+              case CTRL_C: {
+                // Write what was read up to the ^C out, then signal. Continue loop from the byte after this
+                // FIXME handle write errors?, and blocking
+                // Check a poll in a function, and check for POLLERR
+                if (i > 0) drain_buffer_size(child_stdin_fd, &stdin_buf, i - 1, true);
+                stdin_buf.offset ++;
+                to_write = stdin_buf.capacity - stdin_buf.offset;
+                i = 0;
+                if (kill(pid, SIGINT) == -1) {
+                  perror("kill sigint");
+                  ABORT();
+                }
+              }; break;
+
+              case CTRL_D: {
+                // Write out up to here, set EOF
+                // FIXME handle write errors, and blocking
+                if (i > 0) drain_buffer_size(child_stdin_fd, &stdin_buf, i - 1, true);
+                stdin_buf.offset ++;
+                to_write = 0;
+                i = 0;
+                eof = true;
+                while (close(child_stdin_fd) == -1) {
+                  if (errno == EINTR) continue;
+                  perror("parent close stdin");
+                  ABORT();
+                  break;
+                }
+              }; break;
+            }
+          }
+          // FIXME handle write errors, and blocking
+          if (!eof) drain_buffer_size(child_stdin_fd, &stdin_buf, to_write, true);
         }
-        ENSURE_INPUT(stdout_buf);
-        for (size_t i = stdout_buf.offset; i < stdout_buf.capacity; i ++) {
-          printf("%c", stdout_buf.buffer[stdout_buf.offset++]);
-        }
-        ENSURE_INPUT(stderr_buf);
-        for (size_t i = stderr_buf.offset; i < stderr_buf.capacity; i ++) {
-          fprintf(stderr, "%c", stderr_buf.buffer[stderr_buf.offset++]);
-        }
+        read_and_drain_buffer(STDOUT_FILENO, &child_stdout_buf, eof, !eof, false);
+        read_and_drain_buffer(STDERR_FILENO, &child_stderr_buf, eof, !eof, false);
       }
-      assert(waitpid(pid, &wstatus, 0) != -1);
-      return WEXITSTATUS(wstatus);
+      read_and_drain_buffer(STDOUT_FILENO, &child_stdout_buf, true, false, false);
+      read_and_drain_buffer(STDERR_FILENO, &child_stderr_buf, true, false, false);
+      if (WIFEXITED(wstatus)) {
+        return WEXITSTATUS(wstatus);
+      } else if (WIFSIGNALED(wstatus)) {
+        return 128 + WTERMSIG(wstatus);
+      } else if (WIFSTOPPED(wstatus)) {
+        return 128 + WSTOPSIG(wstatus);
+      } else {
+        perror("waitpid");
+        fprintf(stderr, "wait returned %d, wstatus = %d\n", wait_ret, wstatus);
+      }
     }
   }
   UNREACHABLE();
@@ -606,9 +850,7 @@ int exit_command(string_array args) {
     args.data[i] = NULL;
   }
   ARRAY_FREE(args);
-  close_open_files();
-  ARRAY_FREE(files);
-  ARRAY_FREE(builtins);
+  cleanup();
   exit(code);
   UNREACHABLE();
   return 0;
@@ -762,13 +1004,20 @@ int cd_command(string_array args) {
 int main(int argc, char **argv) {
   struct termios old_termios;
   if (tcgetattr(STDIN_FILENO, &old_termios) == 0) {
-    struct termios term = old_termios;
+    old_termios_ptr = &old_termios;
+    struct termios term;
     term = old_termios;
-    term.c_lflag &= ~(ICANON|ISIG);
+    term.c_lflag &= ~(ICANON|ISIG|ECHO);
     term.c_cc[VTIME] = 0;
     term.c_cc[VMIN] = 0;
-    assert(tcsetattr(STDIN_FILENO, TCSANOW, &term) == 0);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &term) != 0) {
+      perror("tcsetattr");
+      ABORT();
+    }
+  } else {
+    old_termios_ptr = NULL;
   }
+
   ARRAY_ADD(builtins, COMMAND(help, "Displays help about commands."));
   ARRAY_ADD(builtins, COMMAND(exit, "Exit the shell, with optional code."));
   ARRAY_ADD(builtins, COMMAND(echo, "Prints any arguments to stdout."));
@@ -784,9 +1033,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  while (is_eof(&stdin_buf) == 0) {
-    // FIXME read PS1
-    printf("$ ");
+  // FIXME read PS1
+  printf("$ ");
+  do {
 
     char *delim = " \n";
     string_array args = {0};
@@ -795,7 +1044,9 @@ int main(int argc, char **argv) {
     char *arg;
     bool quoted;
     bool escaped;
-    while ((arg = read_arg(delim, &quoted, &escaped, &quote, &error)) != NULL) {
+    bool first = true;
+    while ((arg = read_arg(delim, &quoted, &escaped, &quote, &error, first)) != NULL) {
+      first = false;
       if (!quoted && !escaped && (strcmp(arg, ">") == 0 || strcmp(arg, ">>") == 0)) {
         long fd = STDOUT_FILENO;
         if (args.size > 0) {
@@ -816,7 +1067,7 @@ int main(int argc, char **argv) {
           break;
         }
 
-        arg = read_arg(delim, &quoted, &escaped, &quote, &error);
+        arg = read_arg(delim, &quoted, &escaped, &quote, &error, false);
         if (error || arg == NULL) {
           fprintf(stderr, "syntax error, missing filename of redirect\n");
           error = true;
@@ -827,6 +1078,12 @@ int main(int argc, char **argv) {
         ARRAY_ENSURE_CAPACITY(files, (size_t)fd + 1);
         if ((size_t)fd >= files.size) files.size = (size_t)fd + 1;
         files.data[fd] = fopen(arg, append ? "a" : "w");
+        if (files.data[fd] == NULL) {
+          fprintf(stderr, "output error, could not open `%s` for opening\n", arg);
+          error = true;
+          free(arg);
+          break;
+        }
         free(arg);
       } else {
         ARRAY_ADD(args, arg);
@@ -846,8 +1103,18 @@ int main(int argc, char **argv) {
     }
     if (code == -1) {
       if (strchr(command, '/') != NULL && access(command, R_OK | X_OK) == 0) {
-        code = run_program(command, args);
+        struct stat command_stat;
+        if (stat(command, &command_stat) == -1) {
+          perror("stat");
+          ABORT();
+        }
 
+        if ((command_stat.st_mode & S_IFMT) == S_IFDIR) {
+          fprintf(stderr, "%s: is a directory\n", command);
+        } else {
+          code = run_program(command, args);
+        }
+        goto cont;
       } else {
         char *path = getenv("PATH");
         if (path != NULL) {
@@ -896,11 +1163,10 @@ cont:
       args.data[i] = NULL;
     }
     ARRAY_FREE(args);
-  }
+    // FIXME read PS1
+    if (!stdin_buf.eof) printf("$ ");
+  } while (!is_eof(&stdin_buf));
 
-  close_open_files();
-  ARRAY_FREE(files);
-  ARRAY_FREE(builtins);
-  tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
+  cleanup();
   return 0;
 }
