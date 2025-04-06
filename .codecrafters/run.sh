@@ -9,4 +9,7 @@
 # Exit early if any commands fail
 set -e
 
-exec /tmp/shell-target "$@"
+/tmp/shell-target "$@"
+ret=$?
+find /tmp -name 'custom_exe*' | grep '' && echo "Return code $ret"
+exit $ret
