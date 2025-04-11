@@ -10,4 +10,4 @@
 set -e
 
 "$(dirname "$0")"/compile.sh
-exec gdb --args /tmp/shell-target "$@"
+exec gdb "$@" /tmp/shell-target

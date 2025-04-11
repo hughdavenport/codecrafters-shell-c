@@ -26,10 +26,11 @@ set -e # Exit early if any commands fail
   CFLAGS="$CFLAGS -Wno-gnu-zero-variadic-macro-arguments"
   tmpdir=$(mktemp -d)
   echo "int main(void) { return 0; }" > "$tmpdir/test.c"
-  ${cc:-cc} -fsanitize=address "$tmpdir/test.c" -o "$tmpFile" 2>/dev/null && CFLAGS="${CFLAGS:-} -fsanitize=address"
+  ${cc:-cc} -fsanitize=address "$tmpdir/test.c" -o "/tmp/shell-target" 2>/dev/null && CFLAGS="${CFLAGS:-} -fsanitize=address"
   rm "$tmpdir/test.c"
   rmdir "$tmpdir"
   echo "cflags = $CFLAGS" >&2
+  PS4='+ '; set -x
   ${cc:-cc} $CFLAGS app/*.c -o "/tmp/shell-target"
 )
 
