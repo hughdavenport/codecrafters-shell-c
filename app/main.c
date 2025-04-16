@@ -33,6 +33,8 @@ struct { \
   X *data; \
 }
 
+typedef ARRAY(char *) str_arr;
+
 #define ARRAY_ENSURE_CAPACITY(arr, cap) do { \
   if ((cap) > (arr).capacity) { \
     (arr).data = realloc((arr).data, sizeof((arr).data[0]) * (cap)); \
@@ -268,20 +270,44 @@ void read_and_drain_buffer(int fd, read_buffer *buf, bool blocking, bool buffer_
   }
 }
 
-char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error) {
+typedef struct {
+  char *match;
+  int idx;
+} completion;
+
+bool do_completion(str_arr *matches, completion *match) {
+  switch (matches->size) {
+    case 0:
+      UNIMPLEMENTED("completion with no options");
+      break;
+
+    case 1:
+      match->match = matches->data[0];
+      return true;
+      break;
+
+    default:
+      UNIMPLEMENTED("completion with many options");
+  }
+  return false;
+}
+
+char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error, bool first) {
   ARRAY(char) ret = {0};
   *escaped = false;
+  completion match = {0};
+  bool dirty_complete = true;
   while (!*error && !is_eof(&stdin_buf) && (*quote != UNQUOTED || strchr(delim, peek_char(&stdin_buf)) == NULL)) {
     if (!*escaped && *quote == UNQUOTED) {
       if (ret.size == 1 && ret.data[0] == '>') {
         if (peek_char(&stdin_buf) == '>') ARRAY_ADD(ret, read_char(&stdin_buf));
-        ARRAY_ADD(ret, '\0');
-        return ret.data;
+        goto end;
       } else if (ret.size > 0 && peek_char(&stdin_buf) == '>') {
         break;
       }
     }
     *escaped = false;
+    if (peek_char(&stdin_buf) != '\t') dirty_complete = true;
 
     switch (peek_char(&stdin_buf)) {
       case EOF:
@@ -301,6 +327,31 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
 
       case CTRL_D: {
         printf("\a");
+      }; break;
+
+      case '\t': {
+        stdin_buf.offset++;
+        if (first) {
+          // may not need to generate if cycling?
+          str_arr matches = {0};
+          for (size_t i = 0; i < builtins.size; i ++) {
+            if (strncmp(ret.data, builtins.data[i].command, ret.size) == 0) {
+              ARRAY_ADD(matches, builtins.data[i].command);
+            }
+          }
+          if (dirty_complete) match.idx = -1;
+          if (do_completion(&matches, &match)) {
+            printf("%s ", match.match + ret.size);
+            ret.size = strlen(match.match) + 1;
+            ARRAY_ENSURE_CAPACITY(ret, ret.size);
+            strncpy(ret.data, match.match, ret.size);
+            goto end;
+          }
+
+          UNIMPLEMENTED("completion builtins");
+        } else {
+          UNIMPLEMENTED("completion anything? files? idk");
+        }
       }; break;
 
       case '\\': {
@@ -453,6 +504,7 @@ check_unquoted_escape:
     }
     if (!*error) read_char(&stdin_buf);
   }
+end:
   if (*quote != UNQUOTED && is_eof(&stdin_buf)) {
     ARRAY_FREE(ret);
     switch (*quote) {
@@ -478,7 +530,7 @@ check_unquoted_escape:
   return ret.data;
 }
 
-char *_read_tilde_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error) {
+char *_read_tilde_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error, bool first) {
   assert(*quote == UNQUOTED);
   assert(read_char(&stdin_buf) == '~');
 
@@ -513,7 +565,7 @@ start_read_tilde_arg:
     }; break;
 
     case '/': {
-      char *arg = _read_arg(delim, quoted, escaped, quote, error);
+      char *arg = _read_arg(delim, quoted, escaped, quote, error, first);
       if (*error || arg == NULL) return NULL;
       char *home = getenv("HOME");
       if (home == NULL) {
@@ -557,6 +609,9 @@ start_read_tilde_arg:
               stdin_buf.offset ++;
               continue;
 
+            case '\t':
+              UNIMPLEMENTED("completion of all ~users");
+
             default:
               printf("Code %d\n", peek_char(&stdin_buf));
               UNIMPLEMENTED("Unhandled cntrl char in ~user");
@@ -575,7 +630,7 @@ start_read_tilde_arg:
           }
 
           if (peek_char(&stdin_buf) == '/') {
-            char *arg = _read_arg(delim, quoted, escaped, quote, error);
+            char *arg = _read_arg(delim, quoted, escaped, quote, error, first);
             if (*error || arg == NULL) return NULL;
             size_t dir_len = strlen(passwd->pw_dir);
             size_t arg_len = strlen(arg);
@@ -592,7 +647,7 @@ start_read_tilde_arg:
       setpwent();
       endpwent();
       // Haven't found user, fall out
-      char *arg = _read_arg(delim, quoted, escaped, quote, error);
+      char *arg = _read_arg(delim, quoted, escaped, quote, error, first);
       if (*error || arg == NULL) return NULL;
       size_t arg_len = strlen(arg);
       char *ret = malloc(username.size + arg_len + 2);
@@ -607,7 +662,7 @@ start_read_tilde_arg:
     }; break;
   }
   UNREACHABLE();
-  return _read_arg(delim, quoted, escaped, quote, error);
+  return _read_arg(delim, quoted, escaped, quote, error, first);
 }
 
 char *read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error, bool first) {
@@ -642,7 +697,7 @@ start_read_arg:
     }; break;
 
     case '~':
-      return _read_tilde_arg(delim, quoted, escaped, quote, error);
+      return _read_tilde_arg(delim, quoted, escaped, quote, error, first);
 
     case '\n':
       read_char(&stdin_buf);
@@ -650,8 +705,16 @@ start_read_arg:
     case EOF:
       return NULL;
 
+    case '\t': {
+      // TODO if first, then display a list of builtins
+      // if not first, then complete anything
+      printf("\a");
+      stdin_buf.offset ++;
+      goto start_read_arg;
+    }; break;
+
     default:
-      return _read_arg(delim, quoted, escaped, quote, error);
+      return _read_arg(delim, quoted, escaped, quote, error, first);
   }
   UNREACHABLE();
   return NULL;
