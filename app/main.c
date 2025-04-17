@@ -13,6 +13,8 @@
 
 #include <pwd.h>
 
+#include <dirent.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 
 #define CTRL_C 003
@@ -287,6 +289,10 @@ bool do_completion(str_arr *matches, completion *match) {
       break;
 
     default:
+      fprintf(stderr, "too many options (for now). Got %ld\n", matches->size);
+      for (size_t i = 0; i < matches->size; i ++) {
+        fprintf(stderr, " - %s\n", matches->data[i]);
+      }
       UNIMPLEMENTED("completion with many options");
   }
   return false;
@@ -339,6 +345,41 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
               ARRAY_ADD(matches, builtins.data[i].command);
             }
           }
+          size_t cmd_start = matches.size;
+          char *path = getenv("PATH");
+          if (path != NULL) {
+            char *p = path;
+            while (*p != '\0') {
+              while (*p != '\0' && *p != ':') p ++;
+              char was_p = *p;
+              *p = '\0';
+              DIR *dir = opendir(path);
+              if (dir) {
+                struct dirent *entry;
+                while ((entry = readdir(dir)) != NULL) {
+                  if (strncmp(ret.data, entry->d_name, ret.size) != 0) continue;
+                  bool ok = true;
+                  for (size_t i = 0; i < matches.size; i ++) {
+                    if (strcmp(matches.data[i], entry->d_name) == 0) {
+                      ok = false;
+                      break;
+                    }
+                  }
+                  if (!ok) continue;
+                  char *file_path = NULL;
+                  assert(asprintf(&file_path, "%s/%s", path, entry->d_name) != 0);
+                  if (access(file_path, R_OK | X_OK) == 0) {
+                    ARRAY_ADD(matches, strdup(entry->d_name));
+                  }
+                  free(file_path);
+                }
+                closedir(dir);
+              }
+              *p = was_p;
+              if (was_p != '\0') p ++;
+              path = p;
+            }
+          }
           if (dirty_complete) match.idx = -1;
           if (do_completion(&matches, &match)) {
             if (match.idx == -1) {
@@ -346,11 +387,21 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
               ret.size = strlen(match.match) + 1;
               ARRAY_ENSURE_CAPACITY(ret, ret.size);
               strncpy(ret.data, match.match, ret.size);
+              // builtin matches are not allocated, commands after it are
+              for (size_t i = cmd_start; i < matches.size; i ++) {
+                free(matches.data[i]);
+              }
+              ARRAY_FREE(matches);
               goto end;
             } else {
               UNIMPLEMENTED("multiple completions");
             }
           }
+          // builtin matches are not allocated, commands after it are
+          for (size_t i = cmd_start; i < matches.size; i ++) {
+            free(matches.data[i]);
+          }
+          ARRAY_FREE(matches);
           printf("\a");
           continue;
         } else {
@@ -534,6 +585,17 @@ end:
   return ret.data;
 }
 
+typedef struct { char *username; char *home; } passwd_t;
+void passwd_free(passwd_t *pass) {
+  free(pass->username);
+  free(pass->home);
+}
+
+#define PASSWD(usr, dir) (passwd_t){ \
+    .username = (usr), \
+    .home = (dir) \
+}
+
 char *_read_tilde_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error, bool first) {
   assert(*quote == UNQUOTED);
   assert(read_char(&stdin_buf) == '~');
@@ -594,11 +656,32 @@ start_read_tilde_arg:
 
     default: {
       // ~user
+      ARRAY(passwd_t*) users = {0};
+
+#define passwd_array_free(arr) do { \
+  for (size_t i = 0; i < (arr).size; i ++) { \
+    passwd_free((arr).data[i]); \
+    free((arr).data[i]); \
+  } \
+} while (0)
+      while ((passwd = getpwent()) != NULL) {
+        passwd_t *pass = malloc(sizeof(passwd_t));
+        assert(pass != NULL);
+        pass->username = strdup(passwd->pw_name);
+        pass->home = strdup(passwd->pw_dir);
+        // FIXME gcc and clang with ASAN will abort with buffer overflow
+        ARRAY_ADD(users, pass);
+      }
+      setpwent();
+      endpwent();
       ARRAY(char) username = {0};
+      bool dirty_complete = true;
+      completion match = {0};
       while (!is_eof(&stdin_buf) &&
           peek_char(&stdin_buf) != '\0' &&
           peek_char(&stdin_buf) != '/' &&
           strchr(delim, peek_char(&stdin_buf)) == NULL) {
+        if (peek_char(&stdin_buf) != '\t') dirty_complete = true;
         if (iscntrl(peek_char(&stdin_buf))) {
           switch (peek_char(&stdin_buf)) {
             case CTRL_C:
@@ -613,8 +696,30 @@ start_read_tilde_arg:
               stdin_buf.offset ++;
               continue;
 
-            case '\t':
-              UNIMPLEMENTED("completion of all ~users");
+            case '\t': {
+              stdin_buf.offset ++;
+              str_arr matches = {0};
+              for (size_t i = 0; i < users.size; i ++) {
+                if (strncmp(username.data, users.data[i]->username, username.size) == 0) {
+                  ARRAY_ADD(matches, users.data[i]->username);
+                }
+              }
+              if (dirty_complete) match.idx = -1;
+              if (do_completion(&matches, &match)) {
+                if (match.idx == -1) {
+                  // FIXME in bash, if user has home folder, completes to ~user/, if not, then ~userSPACE
+                  printf("%s", match.match + username.size);
+                  username.size = strlen(match.match) + 1;
+                  ARRAY_ENSURE_CAPACITY(username, username.size);
+                  strncpy(username.data, match.match, username.size);
+                  goto tilde_end;
+                } else {
+                  UNIMPLEMENTED("multiple completions");
+                }
+              } else {
+                printf("\a");
+              }
+            }; break;
 
             default:
               printf("Code %d\n", peek_char(&stdin_buf));
@@ -623,36 +728,41 @@ start_read_tilde_arg:
         }
         ARRAY_ADD(username, read_char(&stdin_buf));
       }
-      while ((passwd = getpwent()) != NULL) {
-        size_t len = strlen(passwd->pw_name);
-        if (len == username.size && strncmp(username.data, passwd->pw_name, len) == 0) {
-          setpwent();
-          endpwent();
-
+tilde_end:
+      for (size_t i = 0; i < users.size; i ++) {
+        size_t len = strlen(users.data[i]->username);
+        if (len == username.size && strncmp(username.data, users.data[i]->username, len) == 0) {
           if (peek_char(&stdin_buf) == '\0' || strchr(delim, peek_char(&stdin_buf)) != NULL) {
-            return strdup(passwd->pw_dir);
+            char *ret = strdup(users.data[i]->username);
+            ARRAY_FREE(username);
+            passwd_array_free(users);
+            return ret;
           }
 
           if (peek_char(&stdin_buf) == '/') {
             char *arg = _read_arg(delim, quoted, escaped, quote, error, first);
             if (*error || arg == NULL) return NULL;
-            size_t dir_len = strlen(passwd->pw_dir);
+            size_t dir_len = strlen(users.data[i]->home);
             size_t arg_len = strlen(arg);
             char *full_path = malloc(dir_len + arg_len + 1);
             assert(full_path != NULL);
-            strcpy(full_path, passwd->pw_dir);
+            strcpy(full_path, users.data[i]->home);
             strcpy(full_path + dir_len, arg);
             full_path[dir_len + arg_len] = '\0';
             free(arg);
+            ARRAY_FREE(username);
+            passwd_array_free(users);
             return full_path;
           }
         }
       }
-      setpwent();
-      endpwent();
+      passwd_array_free(users);
       // Haven't found user, fall out
       char *arg = _read_arg(delim, quoted, escaped, quote, error, first);
-      if (*error || arg == NULL) return NULL;
+      if (*error || arg == NULL) {
+        ARRAY_FREE(username);
+        return NULL;
+      }
       size_t arg_len = strlen(arg);
       char *ret = malloc(username.size + arg_len + 2);
       assert(ret != NULL);
