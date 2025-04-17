@@ -278,7 +278,7 @@ typedef struct {
 bool do_completion(str_arr *matches, completion *match) {
   switch (matches->size) {
     case 0:
-      UNIMPLEMENTED("completion with no options");
+      return false;
       break;
 
     case 1:
@@ -341,14 +341,18 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
           }
           if (dirty_complete) match.idx = -1;
           if (do_completion(&matches, &match)) {
-            printf("%s ", match.match + ret.size);
-            ret.size = strlen(match.match) + 1;
-            ARRAY_ENSURE_CAPACITY(ret, ret.size);
-            strncpy(ret.data, match.match, ret.size);
-            goto end;
+            if (match.idx == -1) {
+              printf("%s ", match.match + ret.size);
+              ret.size = strlen(match.match) + 1;
+              ARRAY_ENSURE_CAPACITY(ret, ret.size);
+              strncpy(ret.data, match.match, ret.size);
+              goto end;
+            } else {
+              UNIMPLEMENTED("multiple completions");
+            }
           }
-
-          UNIMPLEMENTED("completion builtins");
+          printf("\a");
+          continue;
         } else {
           UNIMPLEMENTED("completion anything? files? idk");
         }
