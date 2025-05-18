@@ -23,6 +23,7 @@ set -e # Exit early if any commands fail
   CFLAGS="-Wall -Wextra -Wpedantic -Werror"
   CFLAGS="$CFLAGS -ggdb"
   CFLAGS="$CFLAGS -lcurl -lcrypto"
+  CFLAGS="$CFLAGS -Wno-implicit-fallthrough"
   CFLAGS="$CFLAGS -Wno-gnu-zero-variadic-macro-arguments"
   tmpdir=$(mktemp -d)
   echo "int main(void) { return 0; }" > "$tmpdir/test.c"
