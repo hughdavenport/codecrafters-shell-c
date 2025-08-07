@@ -44,8 +44,9 @@ typedef ARRAY(char *) str_arr;
         perror("ARRAY_ENSURE_CAPACITY realloc"); \
         ABORT(); \
     } \
-    memset((arr).data + sizeof((arr).data[0]) * (arr).capacity, \
-        '\0', sizeof((arr).data[0]) * ((cap) - (arr).capacity)); \
+      /* FIXME investigate memset */ \
+    /* memset((arr).data + sizeof((arr).data[0]) * (arr).capacity, */ \
+    /*     '\0', sizeof((arr).data[0]) * ((cap) - (arr).capacity)); */ \
     (arr).capacity = (cap); \
   } \
 } while (false)
@@ -56,6 +57,23 @@ typedef ARRAY(char *) str_arr;
     ARRAY_ENSURE_CAPACITY((arr), (new_capacity)); \
   } \
   (arr).data[(arr).size ++] = (value); \
+} while (false)
+
+#define SORTED_ARRAY_ADD(arr, value, sortfn) do { \
+  if ((arr).size + 2 > (arr).capacity) { \
+    size_t new_capacity = (arr).capacity == 0 ? 16 : (arr).capacity * 2; \
+    ARRAY_ENSURE_CAPACITY((arr), (new_capacity)); \
+  } \
+  ARRAY_ADD((arr), (value)); \
+  for (size_t i = (arr).size - 1; i > 0; i --) { \
+    if ((sortfn)((arr).data[i - 1], (arr).data[i]) > 0) { \
+      (arr).data[(arr).size] = (arr).data[i]; \
+      (arr).data[i] = (arr).data[i - 1]; \
+      (arr).data[i - 1] = (arr).data[(arr).size]; \
+    } else { \
+      break; \
+    } \
+  } \
 } while (false)
 
 #define ARRAY_FREE(arr) do { \
@@ -289,11 +307,9 @@ bool do_completion(str_arr *matches, completion *match) {
       break;
 
     default:
-      fprintf(stderr, "too many options (for now). Got %ld\n", matches->size);
-      for (size_t i = 0; i < matches->size; i ++) {
-        fprintf(stderr, " - %s\n", matches->data[i]);
-      }
-      UNIMPLEMENTED("completion with many options");
+      match->idx = (match->idx + 1) % matches->size;
+      match->match = matches->data[match->idx];
+      return true;
   }
   return false;
 }
@@ -342,7 +358,7 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
           str_arr matches = {0};
           for (size_t i = 0; i < builtins.size; i ++) {
             if (strncmp(ret.data, builtins.data[i].command, ret.size) == 0) {
-              ARRAY_ADD(matches, builtins.data[i].command);
+              SORTED_ARRAY_ADD(matches, builtins.data[i].command, strcmp);
             }
           }
           size_t cmd_start = matches.size;
@@ -369,7 +385,7 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
                   char *file_path = NULL;
                   assert(asprintf(&file_path, "%s/%s", path, entry->d_name) != 0);
                   if (access(file_path, R_OK | X_OK) == 0) {
-                    ARRAY_ADD(matches, strdup(entry->d_name));
+                    SORTED_ARRAY_ADD(matches, strdup(entry->d_name), strcmp);
                   }
                   free(file_path);
                 }
@@ -701,7 +717,7 @@ start_read_tilde_arg:
               str_arr matches = {0};
               for (size_t i = 0; i < users.size; i ++) {
                 if (strncmp(username.data, users.data[i]->username, username.size) == 0) {
-                  ARRAY_ADD(matches, users.data[i]->username);
+                  SORTED_ARRAY_ADD(matches, users.data[i]->username, strcmp);
                 }
               }
               if (dirty_complete) match.idx = -1;
