@@ -19,6 +19,8 @@
 
 #define CTRL_C 003
 #define CTRL_D 004
+#define BACKSPACE 0177
+#define ESC 033
 
 struct termios *old_termios_ptr = NULL;
 
@@ -35,8 +37,6 @@ struct { \
   X *data; \
 }
 
-typedef ARRAY(char *) str_arr;
-
 #define ARRAY_ENSURE_CAPACITY(arr, cap) do { \
   if ((cap) > (arr).capacity) { \
     (arr).data = realloc((arr).data, sizeof((arr).data[0]) * (cap)); \
@@ -44,9 +44,8 @@ typedef ARRAY(char *) str_arr;
         perror("ARRAY_ENSURE_CAPACITY realloc"); \
         ABORT(); \
     } \
-      /* FIXME investigate memset */ \
-    /* memset((arr).data + sizeof((arr).data[0]) * (arr).capacity, */ \
-    /*     '\0', sizeof((arr).data[0]) * ((cap) - (arr).capacity)); */ \
+    memset((arr).data + sizeof((arr).data[0]) * (arr).capacity, \
+        '\0', sizeof((arr).data[0]) * ((cap) - (arr).capacity)); \
     (arr).capacity = (cap); \
   } \
 } while (false)
@@ -295,7 +294,7 @@ typedef struct {
   int idx;
 } completion;
 
-bool do_completion(str_arr *matches, completion *match) {
+bool do_completion(string_array *matches, completion *match) {
   switch (matches->size) {
     case 0:
       return false;
@@ -315,7 +314,7 @@ bool do_completion(str_arr *matches, completion *match) {
   return false;
 }
 
-char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error, bool first) {
+char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error, string_array *args, bool first) {
   ARRAY(char) ret = {0};
   *escaped = false;
   completion match = {0};
@@ -334,7 +333,25 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
       completing = 0;
     }
 
+    /* printf("|%o|", peek_char(&stdin_buf)); */
+
     switch (peek_char(&stdin_buf)) {
+      case BACKSPACE:
+        stdin_buf.offset ++;
+        ret.size --;
+        /* FIXME reprint args */
+        // FIXME read PS1
+        printf("\r\033[J$");
+        for (size_t i = 0; i < args->size; i ++) {
+          printf(" %s", args->data[i]);
+        }
+        printf(" %.*s", (int)ret.size, ret.data);
+        break;
+
+      case ESC:
+        UNIMPLEMENTED("implement esc/csi sequences");
+        break;
+
       case EOF:
         UNREACHABLE();
         ARRAY_FREE(ret);
@@ -358,7 +375,7 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
         stdin_buf.offset++;
         if (first) {
           // may not need to generate if cycling?
-          str_arr matches = {0};
+          string_array matches = {0};
           for (size_t i = 0; i < builtins.size; i ++) {
             if (strncmp(ret.data, builtins.data[i].command, ret.size) == 0) {
               SORTED_ARRAY_ADD(matches, builtins.data[i].command, strcmp);
@@ -439,7 +456,11 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
                         display = false;
                         // FIXME read PS1
                         completing = 0;
-                        printf("^C\n$ %.*s", (int)ret.size, ret.data);
+                        printf("^C\n$");
+                        for (size_t i = 0; i < args->size; i ++) {
+                          printf(" %s", args->data[i]);
+                        }
+                        printf(" %.*s", (int)ret.size, ret.data);
                         break;
                       } else if (c == 'y' || c == 'Y') {
                         display = true;
@@ -682,7 +703,7 @@ void passwd_free(passwd_t *pass) {
     .home = (dir) \
 }
 
-char *_read_tilde_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error, bool first) {
+char *_read_tilde_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error, string_array *args, bool first) {
   assert(*quote == UNQUOTED);
   assert(read_char(&stdin_buf) == '~');
 
@@ -717,7 +738,7 @@ start_read_tilde_arg:
     }; break;
 
     case '/': {
-      char *arg = _read_arg(delim, quoted, escaped, quote, error, first);
+      char *arg = _read_arg(delim, quoted, escaped, quote, error, args, first);
       if (*error || arg == NULL) return NULL;
       char *home = getenv("HOME");
       if (home == NULL) {
@@ -784,7 +805,7 @@ start_read_tilde_arg:
 
             case '\t': {
               stdin_buf.offset ++;
-              str_arr matches = {0};
+              string_array matches = {0};
               for (size_t i = 0; i < users.size; i ++) {
                 if (strncmp(username.data, users.data[i]->username, username.size) == 0) {
                   SORTED_ARRAY_ADD(matches, users.data[i]->username, strcmp);
@@ -826,7 +847,7 @@ tilde_end:
           }
 
           if (peek_char(&stdin_buf) == '/') {
-            char *arg = _read_arg(delim, quoted, escaped, quote, error, first);
+            char *arg = _read_arg(delim, quoted, escaped, quote, error, args, first);
             if (*error || arg == NULL) return NULL;
             size_t dir_len = strlen(users.data[i]->home);
             size_t arg_len = strlen(arg);
@@ -844,7 +865,7 @@ tilde_end:
       }
       passwd_array_free(users);
       // Haven't found user, fall out
-      char *arg = _read_arg(delim, quoted, escaped, quote, error, first);
+      char *arg = _read_arg(delim, quoted, escaped, quote, error, args, first);
       if (*error || arg == NULL) {
         ARRAY_FREE(username);
         return NULL;
@@ -862,10 +883,10 @@ tilde_end:
     }; break;
   }
   UNREACHABLE();
-  return _read_arg(delim, quoted, escaped, quote, error, first);
+  return _read_arg(delim, quoted, escaped, quote, error, args, first);
 }
 
-char *read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error, bool first) {
+char *read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quote, bool *error, string_array *args, bool first) {
   assert(*quote == UNQUOTED);
   *quoted = false;
 
@@ -897,7 +918,7 @@ start_read_arg:
     }; break;
 
     case '~':
-      return _read_tilde_arg(delim, quoted, escaped, quote, error, first);
+      return _read_tilde_arg(delim, quoted, escaped, quote, error, args, first);
 
     case '\n':
       read_char(&stdin_buf);
@@ -906,7 +927,7 @@ start_read_arg:
       return NULL;
 
     default:
-      return _read_arg(delim, quoted, escaped, quote, error, first);
+      return _read_arg(delim, quoted, escaped, quote, error, args, first);
   }
   UNREACHABLE();
   return NULL;
@@ -1300,7 +1321,7 @@ int main(int argc, char **argv) {
     bool quoted;
     bool escaped;
     bool first = true;
-    while ((arg = read_arg(delim, &quoted, &escaped, &quote, &error, first)) != NULL) {
+    while ((arg = read_arg(delim, &quoted, &escaped, &quote, &error, &args, first)) != NULL) {
       first = false;
       if (!quoted && !escaped && (strcmp(arg, ">") == 0 || strcmp(arg, ">>") == 0)) {
         long fd = STDOUT_FILENO;
@@ -1322,7 +1343,7 @@ int main(int argc, char **argv) {
           break;
         }
 
-        arg = read_arg(delim, &quoted, &escaped, &quote, &error, false);
+        arg = read_arg(delim, &quoted, &escaped, &quote, &error, &args, false);
         if (error || arg == NULL) {
           fprintf(stderr, "syntax error, missing filename of redirect\n");
           error = true;
