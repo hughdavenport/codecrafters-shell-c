@@ -318,7 +318,7 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
   ARRAY(char) ret = {0};
   *escaped = false;
   completion match = {0};
-  bool dirty_complete = true;
+  int completing = 0;
   while (!*error && !is_eof(&stdin_buf) && (*quote != UNQUOTED || strchr(delim, peek_char(&stdin_buf)) == NULL)) {
     if (!*escaped && *quote == UNQUOTED) {
       if (ret.size == 1 && ret.data[0] == '>') {
@@ -329,7 +329,9 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
       }
     }
     *escaped = false;
-    if (peek_char(&stdin_buf) != '\t') dirty_complete = true;
+    if (peek_char(&stdin_buf) != '\t') {
+      completing = 0;
+    }
 
     switch (peek_char(&stdin_buf)) {
       case EOF:
@@ -396,7 +398,6 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
               path = p;
             }
           }
-          if (dirty_complete) match.idx = -1;
           if (do_completion(&matches, &match)) {
             if (match.idx == -1) {
               printf("%s ", match.match + ret.size);
@@ -410,7 +411,75 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
               ARRAY_FREE(matches);
               goto end;
             } else {
-              UNIMPLEMENTED("multiple completions");
+              if (completing) {
+                if (completing == 1) {
+                  bool display = true;
+                  if (matches.size > 50) {
+                    printf("\nDisplay all %lu possibilities? (y or n)", matches.size);
+
+                    struct termios *old_termios_ptr;
+                    struct termios old_termios;
+                    if (tcgetattr(STDIN_FILENO, &old_termios) == 0) {
+                      old_termios_ptr = &old_termios;
+                      struct termios term;
+                      term = old_termios;
+                      term.c_lflag &= ~(ICANON|ISIG|ECHO);
+                      term.c_cc[VTIME] = 0;
+                      term.c_cc[VMIN] = 0;
+                      if (tcsetattr(STDIN_FILENO, TCSANOW, &term) != 0) {
+                        perror("tcsetattr");
+                        ABORT();
+                      }
+                    }
+                    while (!is_eof(&stdin_buf)) {
+                      char c = peek_char(&stdin_buf);
+                      stdin_buf.offset ++;
+                      if (c == CTRL_C) {
+                        display = false;
+                        // FIXME read PS1
+                        completing = 0;
+                        printf("^C\n$ %.*s", (int)ret.size, ret.data);
+                        break;
+                      } else if (c == 'y' || c == 'Y') {
+                        display = true;
+                        break;
+                      } else if (c == 'n' || c == 'N') {
+                        display = false;
+                        completing = 0;
+                        // FIXME read PS1
+                        printf("\n$ %.*s", (int)ret.size, ret.data);
+                        break;
+                      } else {
+                        printf("\a");
+                      }
+                    }
+                    if (old_termios_ptr) {
+                      if (tcsetattr(STDIN_FILENO, TCSANOW, old_termios_ptr) != 0) {
+                        perror("tcsetattr");
+                        ABORT();
+                      }
+                    }
+                  }
+                  if (display) {
+                    printf("\n");
+                    for (size_t i = 0; i < matches.size; i ++) {
+                      if (i) printf("  ");
+                      printf("%s", matches.data[i]);
+                    }
+                    // FIXME read PS1
+                    printf("\n$ %.*s", (int)ret.size, ret.data);
+                    completing = 2;
+                    match.idx = -1;
+                  }
+                } else {
+                  printf("TODO: cycle completion %s\n", match.match);
+                }
+              } else {
+                printf("\a");
+                completing = 1;
+                match.idx = -1;
+              }
+              continue;
             }
           }
           // builtin matches are not allocated, commands after it are
@@ -730,7 +799,7 @@ start_read_tilde_arg:
                   strncpy(username.data, match.match, username.size);
                   goto tilde_end;
                 } else {
-                  UNIMPLEMENTED("multiple completions");
+                  UNIMPLEMENTED("multiple tilde completions");
                 }
               } else {
                 printf("\a");
@@ -834,14 +903,6 @@ start_read_arg:
       // fall through
     case EOF:
       return NULL;
-
-    case '\t': {
-      // TODO if first, then display a list of builtins
-      // if not first, then complete anything
-      printf("\a");
-      stdin_buf.offset ++;
-      goto start_read_arg;
-    }; break;
 
     default:
       return _read_arg(delim, quoted, escaped, quote, error, first);
@@ -1196,21 +1257,6 @@ int cd_command(string_array args) {
 
 int main(int argc, char **argv) {
   struct termios old_termios;
-  if (tcgetattr(STDIN_FILENO, &old_termios) == 0) {
-    old_termios_ptr = &old_termios;
-    struct termios term;
-    term = old_termios;
-    term.c_lflag &= ~(ICANON|ISIG|ECHO);
-    term.c_cc[VTIME] = 0;
-    term.c_cc[VMIN] = 0;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &term) != 0) {
-      perror("tcsetattr");
-      ABORT();
-    }
-  } else {
-    old_termios_ptr = NULL;
-  }
-
   ARRAY_ADD(builtins, COMMAND(help, "Displays help about commands."));
   ARRAY_ADD(builtins, COMMAND(exit, "Exit the shell, with optional code."));
   ARRAY_ADD(builtins, COMMAND(echo, "Prints any arguments to stdout."));
@@ -1224,6 +1270,21 @@ int main(int argc, char **argv) {
   if (argc > 1) {
     fprintf(stderr, "%s: no arguments supported\n", argv[0]);
     return 1;
+  }
+
+  if (tcgetattr(STDIN_FILENO, &old_termios) == 0) {
+    old_termios_ptr = &old_termios;
+    struct termios term;
+    term = old_termios;
+    term.c_lflag &= ~(ICANON|ISIG|ECHO);
+    term.c_cc[VTIME] = 0;
+    term.c_cc[VMIN] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &term) != 0) {
+      perror("tcsetattr");
+      ABORT();
+    }
+  } else {
+    old_termios_ptr = NULL;
   }
 
   // FIXME read PS1
