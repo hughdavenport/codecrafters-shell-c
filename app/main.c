@@ -338,15 +338,16 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
     switch (peek_char(&stdin_buf)) {
       case BACKSPACE:
         stdin_buf.offset ++;
-        ret.size --;
-        /* FIXME reprint args */
-        // FIXME read PS1
-        printf("\r\033[J$");
-        for (size_t i = 0; i < args->size; i ++) {
-          printf(" %s", args->data[i]);
+        if (ret.size) {
+          ret.size --;
+          // FIXME read PS1
+          printf("\r\033[J$");
+          for (size_t i = 0; i < args->size; i ++) {
+            printf(" %s", args->data[i]);
+          }
+          printf(" %.*s", (int)ret.size, ret.data);
         }
-        printf(" %.*s", (int)ret.size, ret.data);
-        break;
+        continue;
 
       case ESC:
         UNIMPLEMENTED("implement esc/csi sequences");
