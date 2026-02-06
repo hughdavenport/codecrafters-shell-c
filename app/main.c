@@ -302,6 +302,7 @@ bool do_completion(str_arr *matches, completion *match) {
       break;
 
     case 1:
+      match->idx = -1;
       match->match = matches->data[0];
       return true;
       break;
