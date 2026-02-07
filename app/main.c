@@ -44,7 +44,7 @@ struct { \
         perror("ARRAY_ENSURE_CAPACITY realloc"); \
         ABORT(); \
     } \
-    memset((arr).data + sizeof((arr).data[0]) * (arr).capacity, \
+    memset((arr).data + (arr).capacity, \
         '\0', sizeof((arr).data[0]) * ((cap) - (arr).capacity)); \
     (arr).capacity = (cap); \
   } \
@@ -125,6 +125,35 @@ int exit_command(string_array args);
 #define UNIMPLEMENTED(msg) do { fprintf(stderr, "%s:%d: UNIMPLEMENTED: %s", __FILE__, __LINE__, msg); ABORT(); } while (false)
 #define UNREACHABLE() do { fprintf(stderr, "%s:%d: UNREACHABLE", __FILE__, __LINE__); ABORT(); } while (false)
 
+typedef struct {
+  char *str;
+  bool allocated;
+} match_t;
+typedef ARRAY(match_t) match_array;
+int match_strcmp(match_t m1, match_t m2) {
+  return strcmp(m1.str, m2.str);
+}
+
+
+typedef struct {
+  const char *str;
+  size_t len;
+} string_view;
+
+#define sv_fmt "%.*s"
+#define sv_args(sv) (int)(sv).len, (sv).str
+
+string_view longest_common_prefix(const char *s1, const char *s2) {
+  if (!s1 || !s2) UNREACHABLE();
+
+  const char *p1 = s1;
+  const char *p2 = s2;
+  while (*p1 && *p2 && *p1 == *p2) {
+    p1 ++;
+    p2 ++;
+  }
+  return (string_view){.str = s1, .len = p1 - s1};
+}
 
 typedef struct {
   char buffer[4097];
@@ -290,11 +319,11 @@ void read_and_drain_buffer(int fd, read_buffer *buf, bool blocking, bool buffer_
 }
 
 typedef struct {
-  char *match;
+  match_t match;
   int idx;
 } completion;
 
-bool do_completion(string_array *matches, completion *match) {
+bool do_completion(match_array *matches, completion *match) {
   switch (matches->size) {
     case 0:
       return false;
@@ -374,15 +403,16 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
 
       case '\t': {
         stdin_buf.offset++;
-        if (first) {
+        if (first) { // First argument in line (i.e command)
           // may not need to generate if cycling?
-          string_array matches = {0};
+          match_array matches = {0};
+          /* FIXME slow duplication here, only need to on change */
           for (size_t i = 0; i < builtins.size; i ++) {
             if (strncmp(ret.data, builtins.data[i].command, ret.size) == 0) {
-              SORTED_ARRAY_ADD(matches, builtins.data[i].command, strcmp);
+              match_t m = {.str = builtins.data[i].command};
+              SORTED_ARRAY_ADD(matches, m, match_strcmp);
             }
           }
-          size_t cmd_start = matches.size;
           char *path = getenv("PATH");
           if (path != NULL) {
             char *p = path;
@@ -395,18 +425,20 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
                 struct dirent *entry;
                 while ((entry = readdir(dir)) != NULL) {
                   if (strncmp(ret.data, entry->d_name, ret.size) != 0) continue;
-                  bool ok = true;
+                  bool existing_command = false;
                   for (size_t i = 0; i < matches.size; i ++) {
-                    if (strcmp(matches.data[i], entry->d_name) == 0) {
-                      ok = false;
+                    if (strcmp(matches.data[i].str, entry->d_name) == 0) {
+                      existing_command = true;
                       break;
                     }
                   }
-                  if (!ok) continue;
+                  if (existing_command) continue;
+
                   char *file_path = NULL;
                   assert(asprintf(&file_path, "%s/%s", path, entry->d_name) != 0);
                   if (access(file_path, R_OK | X_OK) == 0) {
-                    SORTED_ARRAY_ADD(matches, strdup(entry->d_name), strcmp);
+                    match_t m = {.str = strdup(entry->d_name), .allocated = true};
+                    SORTED_ARRAY_ADD(matches, m, match_strcmp);
                   }
                   free(file_path);
                 }
@@ -419,19 +451,41 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
           }
           if (do_completion(&matches, &match)) {
             if (match.idx == -1) {
-              printf("%s ", match.match + ret.size);
-              ret.size = strlen(match.match) + 1;
+              printf("%s ", match.match.str + ret.size);
+              ret.size = strlen(match.match.str) + 1;
               ARRAY_ENSURE_CAPACITY(ret, ret.size);
-              strncpy(ret.data, match.match, ret.size);
+              strncpy(ret.data, match.match.str, ret.size);
               // builtin matches are not allocated, commands after it are
-              for (size_t i = cmd_start; i < matches.size; i ++) {
-                free(matches.data[i]);
+              for (size_t i = 0; i < matches.size; i ++) {
+                if (matches.data[i].allocated) free(matches.data[i].str);
               }
               ARRAY_FREE(matches);
               goto end;
             } else {
-              if (completing) {
-                if (completing == 1) {
+              /* multiple completions */
+
+              switch (completing) {
+                case 0:
+                  /* first check if there is a longest common prefix */
+                  /* as matches is sorted, this is just the common prefix between first and last */
+                  {};
+                  string_view prefix = longest_common_prefix(matches.data[0].str, matches.data[matches.size - 1].str);
+
+                  if (prefix.len == ret.size) {
+                    printf("\a");
+                    completing = 1;
+                    match.idx = -1;
+                  } else {
+                    string_view rest = (string_view){.str = prefix.str + ret.size, .len = prefix.len - ret.size};
+                    printf(sv_fmt, sv_args(rest));
+                    ARRAY_ENSURE_CAPACITY(ret, ret.size + rest.len);
+                    strncpy(ret.data + ret.size, rest.str, rest.len);
+                    ret.size += rest.len;
+                  }
+
+                  break;
+
+                case 1:
                   bool display = true;
                   if (matches.size > 50) {
                     printf("\nDisplay all %lu possibilities? (y or n)", matches.size);
@@ -487,27 +541,29 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
                     printf("\n");
                     for (size_t i = 0; i < matches.size; i ++) {
                       if (i) printf("  ");
-                      printf("%s", matches.data[i]);
+                      printf("%s", matches.data[i].str);
                     }
                     // FIXME read PS1
                     printf("\n$ %.*s", (int)ret.size, ret.data);
                     completing = 2;
                     match.idx = -1;
                   }
-                } else {
-                  printf("TODO: cycle completion %s\n", match.match);
-                }
-              } else {
-                printf("\a");
-                completing = 1;
-                match.idx = -1;
+                  break;
+
+                case 2:
+                  printf("TODO: cycle completion %s\n", match.match.str);
+                  break;
               }
+              for (size_t i = 0; i < matches.size; i ++) {
+                if (matches.data[i].allocated) free(matches.data[i].str);
+              }
+              ARRAY_FREE(matches);
               continue;
             }
           }
           // builtin matches are not allocated, commands after it are
-          for (size_t i = cmd_start; i < matches.size; i ++) {
-            free(matches.data[i]);
+          for (size_t i = 0; i < matches.size; i ++) {
+            if (matches.data[i].allocated) free(matches.data[i].str);
           }
           ARRAY_FREE(matches);
           printf("\a");
@@ -806,20 +862,21 @@ start_read_tilde_arg:
 
             case '\t': {
               stdin_buf.offset ++;
-              string_array matches = {0};
+              match_array matches = {0};
               for (size_t i = 0; i < users.size; i ++) {
                 if (strncmp(username.data, users.data[i]->username, username.size) == 0) {
-                  SORTED_ARRAY_ADD(matches, users.data[i]->username, strcmp);
+                  match_t m = {.str = users.data[i]->username};
+                  SORTED_ARRAY_ADD(matches, m, match_strcmp);
                 }
               }
               if (dirty_complete) match.idx = -1;
               if (do_completion(&matches, &match)) {
                 if (match.idx == -1) {
                   // FIXME in bash, if user has home folder, completes to ~user/, if not, then ~userSPACE
-                  printf("%s", match.match + username.size);
-                  username.size = strlen(match.match) + 1;
+                  printf("%s", match.match.str + username.size);
+                  username.size = strlen(match.match.str) + 1;
                   ARRAY_ENSURE_CAPACITY(username, username.size);
-                  strncpy(username.data, match.match, username.size);
+                  strncpy(username.data, match.match.str, username.size);
                   goto tilde_end;
                 } else {
                   UNIMPLEMENTED("multiple tilde completions");
