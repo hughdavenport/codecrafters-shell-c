@@ -44,7 +44,7 @@ struct { \
         perror("ARRAY_ENSURE_CAPACITY realloc"); \
         ABORT(); \
     } \
-    memset((arr).data + sizeof((arr).data[0]) * (arr).capacity, \
+    memset((arr).data + (arr).capacity, \
         '\0', sizeof((arr).data[0]) * ((cap) - (arr).capacity)); \
     (arr).capacity = (cap); \
   } \
@@ -377,6 +377,7 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
         if (first) {
           // may not need to generate if cycling?
           string_array matches = {0};
+          /* FIXME slow duplication here, only need to on change */
           for (size_t i = 0; i < builtins.size; i ++) {
             if (strncmp(ret.data, builtins.data[i].command, ret.size) == 0) {
               SORTED_ARRAY_ADD(matches, builtins.data[i].command, strcmp);
@@ -407,6 +408,7 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
                   assert(asprintf(&file_path, "%s/%s", path, entry->d_name) != 0);
                   if (access(file_path, R_OK | X_OK) == 0) {
                     SORTED_ARRAY_ADD(matches, strdup(entry->d_name), strcmp);
+            printf("strdup(%s) => %p (%lu)\n", entry->d_name, (void*)matches.data[matches.size-1], matches.size - 1);
                   }
                   free(file_path);
                 }
@@ -502,6 +504,11 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
                 completing = 1;
                 match.idx = -1;
               }
+          for (size_t i = cmd_start; i < matches.size; i ++) {
+            printf("free(%p) (%s) (%lu vs %lu)\n", (void*)matches.data[i], matches.data[i], i, cmd_start);
+            free(matches.data[i]);
+          }
+          ARRAY_FREE(matches);
               continue;
             }
           }
