@@ -486,6 +486,7 @@ char *_read_arg(const char *delim, bool *quoted, bool *escaped, quote_mode *quot
                   break;
 
                 case 1:
+                  {};
                   bool display = true;
                   if (matches.size > 50) {
                     printf("\nDisplay all %lu possibilities? (y or n)", matches.size);
