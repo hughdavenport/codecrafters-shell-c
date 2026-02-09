@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <sys/stat.h>
 #include <ctype.h>
 #include <assert.h>
@@ -88,7 +89,7 @@ typedef ARRAY(char *) string_array;
 typedef struct {
   char *command;
   char *description;
-  int (*function)(string_array args);
+  int (*function)(string_array args, int infd, int outfd, int errfd);
 } command_t;
 
 #define COMMAND(name, desc) (command_t){ \
@@ -118,7 +119,7 @@ void cleanup(void) {
   }
 }
 
-int exit_command(string_array args);
+int exit_command(string_array args, int infd, int outfd, int errfd);
 
 #define ABORT() do { cleanup(); abort(); } while (0)
 
@@ -993,7 +994,7 @@ start_read_arg:
 }
 
 extern char **environ;
-int run_program(char *file_path, string_array args) {
+int run_program(char *file_path, string_array args, int infd, int outfd, int errfd) {
   ARRAY(char *) argv = {0};
   for (size_t i = 0; i < args.size; i ++) {
     ARRAY_ADD(argv, args.data[i]);
@@ -1018,9 +1019,9 @@ int run_program(char *file_path, string_array args) {
       if (close(stdin_pipe[1]) == -1) { perror("child close stdin_pipe[1]"); ABORT(); }
       if (close(stdout_pipe[0]) == -1) { perror("child close stdout_pipe[0]"); ABORT(); }
       if (close(stderr_pipe[0]) == -1) { perror("child close stderr_pipe[0]"); ABORT(); }
-      if (dup2(stdin_pipe[0], STDIN_FILENO) == -1) { perror("child dup2 stdin"); ABORT(); }
-      if (dup2(stdout_pipe[1], STDOUT_FILENO) == -1) { perror("child dup2 stdout"); ABORT(); }
-      if (dup2(stderr_pipe[1], STDERR_FILENO) == -1) { perror("child dup2 stderr"); ABORT(); }
+      if (dup2(stdin_pipe[0], infd) == -1) { perror("child dup2 stdin"); ABORT(); }
+      if (dup2(stdout_pipe[1], outfd) == -1) { perror("child dup2 stdout"); ABORT(); }
+      if (dup2(stderr_pipe[1], errfd) == -1) { perror("child dup2 stderr"); ABORT(); }
       for (size_t i = 0; i < files.size; i ++) {
         if (files.data[i] != NULL) {
           int fd = fileno(files.data[i]);
@@ -1130,53 +1131,59 @@ wait_loop:
 }
 
 
-int help_command(string_array args) {
-  FILE *out = stdout;
-  if (files.size > STDOUT_FILENO && files.data[STDOUT_FILENO] != NULL) {
-    out = files.data[STDOUT_FILENO];
-  }
-  FILE *err = stdout;
-  if (files.size > STDERR_FILENO && files.data[STDERR_FILENO] != NULL) {
-    err = files.data[STDERR_FILENO];
-  }
+int help_command(string_array args, int infd, int outfd, int errfd) {
+  (void) infd;
 
   if (args.size > 1) {
     char *arg = args.data[1];
     for (size_t i = 0; i < builtins.size; i ++) {
       command_t cmd = builtins.data[i];
       if (strcmp(cmd.command, arg) == 0) {
-
-        fprintf(out, "    %-10s - %s\n", cmd.command, cmd.description);
+        if (dprintf(outfd, "    %-10s - %s\n", cmd.command, cmd.description) == -1) {
+          int err = errno;
+          dprintf(errfd, "ERROR: %s: %s: Could not write to stdout\n", strerrorname_np(err), strerrordesc_np(err));
+          return err;
+        }
         return 0;
       }
     }
-    fprintf(err, "%s: Builtin %s not found\n", args.data[0], args.data[1]);
+    if (dprintf(errfd, "%s: Builtin %s not found\n", args.data[0], args.data[1]) == -1) {
+      int err = errno;
+      dprintf(errfd, "ERROR: %s: %s: Could not write to stdout\n", strerrorname_np(err), strerrordesc_np(err));
+      return err;
+    }
     return 1;
   }
-  fprintf(out, "Available commands:\n");
+  if (dprintf(outfd, "Available commands:\n") == -1) {
+    int err = errno;
+    dprintf(errfd, "ERROR: %s: %s: Could not write to stdout\n", strerrorname_np(err), strerrordesc_np(err));
+    return err;
+  }
   for (size_t i = 0; i < builtins.size; i ++) {
     command_t cmd = builtins.data[i];
-    fprintf(out, "    %-10s - %s\n", cmd.command, cmd.description);
+    if (dprintf(outfd, "    %-10s - %s\n", cmd.command, cmd.description) == -1) {
+      int err = errno;
+      dprintf(errfd, "ERROR: %s: %s: Could not write to stdout\n", strerrorname_np(err), strerrordesc_np(err));
+      return err;
+    }
   }
   return 0;
 }
 
-int exit_command(string_array args) {
-  FILE *err = stdout;
-  if (files.size > STDERR_FILENO && files.data[STDERR_FILENO] != NULL) {
-    err = files.data[STDERR_FILENO];
-  }
+int exit_command(string_array args, int infd, int outfd, int errfd) {
+  (void) infd;
+  (void) outfd;
 
   int code = 0;
   if (args.size > 1) {
     char *end;
     code = strtol(args.data[1], &end, 0);
     if (*end != '\0') {
-      fprintf(err, "%s: numeric argument required\n", args.data[0]);
+      dprintf(errfd, "%s: numeric argument required\n", args.data[0]);
       return 1;
     }
     if (code < 0 || code > 255) {
-      fprintf(err, "%s: exit code must be 0-255\n", args.data[0]);
+      dprintf(errfd, "%s: exit code must be 0-255\n", args.data[0]);
       return 1;
     }
   }
@@ -1191,29 +1198,33 @@ int exit_command(string_array args) {
   return 0;
 }
 
-int echo_command(string_array args) {
-  FILE *out = stdout;
-  if (files.size > STDOUT_FILENO && files.data[STDOUT_FILENO] != NULL) {
-    out = files.data[STDOUT_FILENO];
-  }
+int echo_command(string_array args, int infd, int outfd, int errfd) {
+  (void)infd;
 
   for (size_t i = 1; i < args.size; i ++) {
-    if (i > 1) fprintf(out, " ");
-    fprintf(out, "%s", args.data[i]);
+    if (i > 1) {
+      if (dprintf(outfd, " ") == -1) {
+        int err = errno;
+        dprintf(errfd, "ERROR: %s: %s: Could not write to stdout\n", strerrorname_np(err), strerrordesc_np(err));
+        return err;
+      }
+    }
+    if (dprintf(outfd, "%s", args.data[i]) == -1) {
+      int err = errno;
+      dprintf(errfd, "ERROR: %s: %s: Could not write to stdout\n", strerrorname_np(err), strerrordesc_np(err));
+      return err;
+    }
   }
-  fprintf(out, "\n");
+  if (dprintf(outfd, "\n") == -1) {
+    int err = errno;
+    dprintf(errfd, "ERROR: %s: %s: Could not write to stdout\n", strerrorname_np(err), strerrordesc_np(err));
+    return err;
+  }
   return 0;
 }
 
-int type_command(string_array args) {
-  FILE *out = stdout;
-  if (files.size > STDOUT_FILENO && files.data[STDOUT_FILENO] != NULL) {
-    out = files.data[STDOUT_FILENO];
-  }
-  FILE *err = stdout;
-  if (files.size > STDERR_FILENO && files.data[STDERR_FILENO] != NULL) {
-    err = files.data[STDERR_FILENO];
-  }
+int type_command(string_array args, int infd, int outfd, int errfd) {
+  (void)infd;
 
   int ret = 0;
   for (size_t i = 1; i < args.size; i ++) {
@@ -1221,7 +1232,11 @@ int type_command(string_array args) {
     bool found = false;
     for (size_t b_i = 0; b_i < builtins.size; b_i ++) {
       if (strcmp(arg, builtins.data[b_i].command) == 0) {
-        fprintf(out, "%s is a shell builtin\n", arg);
+        if (dprintf(outfd, "%s is a shell builtin\n", arg) == -1) {
+          int err = errno;
+          dprintf(errfd, "ERROR: %s: %s: Could not write to stdout\n", strerrorname_np(err), strerrordesc_np(err));
+          return err;
+        }
         found = true;
         break;
       }
@@ -1231,7 +1246,11 @@ int type_command(string_array args) {
     }
 
     if (strchr(arg, '/') != NULL && access(arg, R_OK | X_OK) == 0) {
-      fprintf(out, "%s is %s\n", arg, arg);
+      if (dprintf(outfd, "%s is %s\n", arg, arg) == -1) {
+        int err = errno;
+        dprintf(errfd, "ERROR: %s: %s: Could not write to stdout\n", strerrorname_np(err), strerrordesc_np(err));
+        return err;
+      }
       continue;
     }
 
@@ -1245,7 +1264,11 @@ int type_command(string_array args) {
         assert(asprintf(&file_path, "%s/%s", path_name, arg) != 0);
         free(path_name);
         if (access(file_path, R_OK | X_OK) == 0) {
-          fprintf(out, "%s is %s\n", arg, file_path);
+          if (dprintf(outfd, "%s is %s\n", arg, file_path) == -1) {
+            int err = errno;
+            dprintf(errfd, "ERROR: %s: %s: Could not write to stdout\n", strerrorname_np(err), strerrordesc_np(err));
+            return err;
+          }
           free(file_path);
           found = true;
           break;
@@ -1259,46 +1282,50 @@ int type_command(string_array args) {
     }
 
     ret = 1;
-    fprintf(err, "%s: not found\n", arg);
+    if (dprintf(errfd, "%s: not found\n", arg) == -1) {
+      int err = errno;
+      dprintf(errfd, "ERROR: %s: %s: Could not write to stdout\n", strerrorname_np(err), strerrordesc_np(err));
+      return err;
+    }
   }
 
   return ret;
 }
 
-int pwd_command(string_array args) {
-  FILE *out = stdout;
-  if (files.size > STDOUT_FILENO && files.data[STDOUT_FILENO] != NULL) {
-    out = files.data[STDOUT_FILENO];
-  }
-  FILE *err = stdout;
-  if (files.size > STDERR_FILENO && files.data[STDERR_FILENO] != NULL) {
-    err = files.data[STDERR_FILENO];
-  }
+int pwd_command(string_array args, int infd, int outfd, int errfd) {
+  (void)infd;
 
   if (args.size > 1) {
-    fprintf(err, "pwd: arguments not supported yet\n");
+    dprintf(errfd, "pwd: arguments not supported yet\n");
     return 1;
   }
 
   char buf[4096] = {0};
   char *cwd = getcwd(buf, 4096);
   assert(cwd != NULL);
-  fprintf(out, "%s\n", cwd);
+  if (dprintf(outfd, "%s\n", cwd) == -1) {
+    int err = errno;
+    dprintf(errfd, "ERROR: %s: %s: Could not write to stdout\n", strerrorname_np(err), strerrordesc_np(err));
+    return err;
+  }
   return 0;
 }
 
-int cd(char *file_path) {
+int cd(char *file_path, int infd, int outfd, int errfd) {
+  (void) infd;
+  (void) outfd;
+
   if (*file_path == 0) return 0;
   int ret = chdir(file_path);
   if (ret < 0) {
     switch (errno) {
       case EACCES:
-        fprintf(stderr, "cd: %s: Permission denied\n", file_path);
+        dprintf(errfd, "cd: %s: Permission denied\n", file_path);
         return 1;
 
       case ENOENT:
       case ENOTDIR:
-        fprintf(stderr, "cd: %s: No such file or directory\n", file_path);
+        dprintf(errfd, "cd: %s: No such file or directory\n", file_path);
         return 1;
     }
     assert(false && "Uncaught error occured in chdir");
@@ -1308,32 +1335,26 @@ int cd(char *file_path) {
   return 0;
 }
 
-int cd_command(string_array args) {
-  FILE *err = stdout;
-  if (files.size > STDERR_FILENO && files.data[STDERR_FILENO] != NULL) {
-    err = files.data[STDERR_FILENO];
-  }
-
-
+int cd_command(string_array args, int infd, int outfd, int errfd) {
   if (args.size > 2) {
-    fprintf(err, "cd: too many arguments\n");
+    dprintf(errfd, "cd: too many arguments\n");
     return 1;
   }
   if (args.size > 2) {
-    fprintf(err, "cd: too many arguments\n");
+    dprintf(errfd, "cd: too many arguments\n");
     return 1;
   }
 
   if (args.size == 1) {
     char *home = getenv("HOME");
     if (home == NULL) {
-      fprintf(err, "cd: HOME not set\n");
+      dprintf(errfd, "cd: HOME not set\n");
       return 1;
     }
-    return cd(home);
+    return cd(home, infd, outfd, errfd);
   }
 
-  return cd(args.data[1]);
+  return cd(args.data[1], infd, outfd, errfd);
 }
 
 int main(int argc, char **argv) {
@@ -1428,11 +1449,17 @@ int main(int argc, char **argv) {
     if (args.size == 0) goto cont;
     char *command = args.data[0];
 
+    for (size_t i = 0; i < args.size; i ++) {
+      if (strcmp(args.data[i], "|") == 0) {
+        printf("pipeline");
+      }
+    }
+
     int code = -1;
     for (size_t i = 0; i < builtins.size; i ++) {
       if (strcmp(command, builtins.data[i].command) == 0) {
         // FIXME store return value
-        code = builtins.data[i].function(args);
+        code = builtins.data[i].function(args, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO);
         break;
       }
     }
@@ -1447,7 +1474,7 @@ int main(int argc, char **argv) {
         if ((command_stat.st_mode & S_IFMT) == S_IFDIR) {
           fprintf(stderr, "%s: is a directory\n", command);
         } else {
-          code = run_program(command, args);
+          code = run_program(command, args, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO);
         }
         goto cont;
       } else {
@@ -1461,7 +1488,7 @@ int main(int argc, char **argv) {
             assert(asprintf(&file_path, "%s/%s", path_name, command) != 0);
             free(path_name);
             if (access(file_path, R_OK | X_OK) == 0) {
-              code = run_program(file_path, args);
+              code = run_program(command, args, STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO);
               free(file_path);
               break;
             }
@@ -1476,6 +1503,8 @@ int main(int argc, char **argv) {
       }
     }
 cont:
+    /* printf("code = %d\n", code); */
+
     for (size_t i = 0; i < files.size; i ++ ) {
       if (files.data[i] != NULL) {
         fflush(files.data[i]);
