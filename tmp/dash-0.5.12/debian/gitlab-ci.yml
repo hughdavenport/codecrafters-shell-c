@@ -1,0 +1,99 @@
+include:
+ - https://salsa.debian.org/salsa-ci-team/pipeline/raw/master/salsa-ci.yml
+ - https://salsa.debian.org/salsa-ci-team/pipeline/raw/master/pipeline-jobs.yml
+
+variables:
+  DASH_BULLSEYE: 0.5.11+git20200708+dd9ef66-5
+  DASH_BOOKWORM: 0.5.12-2
+  DASH_VERSIONS: $DASH_BULLSEYE $DASH_BOOKWORM
+
+fetch-snapshots:
+  stage: test
+  image: $SALSA_CI_IMAGES_GENERIC_TESTS
+  script:
+    - apt-get install -qy devscripts
+    - |
+      for v in $DASH_VERSIONS
+      do
+        debsnap -v --binary dash $v --force -a amd64
+      done
+  needs: []
+  artifacts:
+    paths:
+      - binary-dash
+
+.install-snapshots:
+  stage: test
+  image: $SALSA_CI_IMAGES_GENERIC_TESTS
+  script:
+    - echo SEQUENCE=$SEQUENCE
+    - |
+      for v in $SEQUENCE
+      do
+        case "$v" in
+          this)
+            echo === Installing the currently built version
+            apt-get install -qy --allow-downgrades ${WORKING_DIR}/dash_*.deb
+            ;;
+          install-diversion)
+            echo === Setting diversion to bash
+            echo "dash dash/sh boolean false" | debconf-set-selections
+            dpkg-reconfigure dash
+            ;;
+          *)
+            echo === Installing $v
+            apt-get install -qy --allow-downgrades ./binary-dash/dash_$v*.deb
+            ;;
+        esac
+      done
+  variables:
+    GIT_STRATEGY: none
+  needs:
+    - job: build
+      artifacts: true
+    - job: fetch-snapshots
+      artifacts: true
+
+test-upgrade:
+  extends: .install-snapshots
+  parallel:
+    matrix:
+      - SEQUENCE:
+        - $DASH_BULLSEYE $DASH_BOOKWORM this
+        - $DASH_BULLSEYE this
+
+test-downgrade:
+  extends: .install-snapshots
+  parallel:
+    matrix:
+      - SEQUENCE:
+        - this $DASH_BOOKWORM
+        - this $DASH_BULLSEYE
+
+test-upgrade-with-diversion:
+  extends: .install-snapshots
+  parallel:
+    matrix:
+      - SEQUENCE:
+        - $DASH_BULLSEYE install-diversion $DASH_BOOKWORM this
+        - $DASH_BULLSEYE install-diversion this
+
+test-downgrade-with-diversion:
+  extends: .install-snapshots
+  parallel:
+    matrix:
+      - SEQUENCE:
+        - $DASH_BULLSEYE install-diversion $DASH_BOOKWORM this $DASH_BOOKWORM
+        - $DASH_BULLSEYE install-diversion $DASH_BOOKWORM this $DASH_BULLSEYE
+        - $DASH_BULLSEYE install-diversion this $DASH_BOOKWORM
+        - $DASH_BULLSEYE install-diversion this $DASH_BULLSEYE
+
+test-upgrade-excluded:
+  extends: test-upgrade
+  before_script:
+    - echo 'path-exclude=/usr/share/man/*' > /etc/dpkg/dpkg.cfg.d/dash
+
+test-upgrade-with-diversion-excluded:
+  extends: test-upgrade-with-diversion
+  before_script:
+    - echo 'path-exclude=/usr/share/man/*' > /etc/dpkg/dpkg.cfg.d/dash
