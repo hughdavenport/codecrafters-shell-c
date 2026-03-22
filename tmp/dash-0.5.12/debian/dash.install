@@ -1,0 +1,3 @@
+/usr/bin/dash  /usr/bin
+/usr/share
+debian/shells.d/dash /usr/share/debianutils/shells.d
